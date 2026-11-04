@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -83,7 +84,7 @@ class PolicyLossConfig(BaseConfig):
 
     Args:
         loss_mode (str): Registered policy loss name. Options: 'vanilla', 'dppo_tv', 'dppo_kl', 'gspo', 'sapo',
-            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', and 'bypass_mode'.
+            'gpg', 'clip_cov', 'kl_cov', 'geo_mean', 'dro', 'cispo', 'entropy_control', and 'bypass_mode'.
         clip_cov_ratio (float): Ratio of tokens to be clipped for clip-cov loss.
         clip_cov_lb (float): Lower bound for clip-cov loss.
         clip_cov_ub (float): Upper bound for clip-cov loss.
@@ -91,6 +92,10 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
+        token_weight_min (float): STEER lower bound; 0.8 matches the released recipe.
+        token_weight_max (float): STEER upper bound; symmetric exponential always uses 1.
+        linear (bool): Use the released linear mapping instead of exponential mapping.
+        entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
     """
 
     loss_mode: str = "vanilla"
@@ -101,6 +106,22 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+    token_weight_min: float = 0.8
+    token_weight_max: float = 1.0
+    linear: bool = False
+    entropy_control_mode: str = "symmetric"
+
+    def __post_init__(self):
+        if self.loss_mode != "entropy_control":
+            return
+        if not math.isfinite(self.token_weight_min) or not 0 < self.token_weight_min <= 1:
+            raise ValueError("STEER token_weight_min must be in (0, 1].")
+        if not math.isfinite(self.token_weight_max) or self.token_weight_max < self.token_weight_min:
+            raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
+        if self.entropy_control_mode not in ("symmetric", "asymmetric"):
+            raise ValueError("STEER entropy_control_mode must be symmetric or asymmetric.")
+        if not self.linear and self.token_weight_max < 1:
+            raise ValueError("STEER exponential mapping requires token_weight_max >= 1.")
 
 
 @dataclass

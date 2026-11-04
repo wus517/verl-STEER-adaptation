@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1374,6 +1375,135 @@ def compute_policy_loss_vanilla(
         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
     }
     return pg_loss, pg_metrics
+
+
+@torch.no_grad()
+def compute_token_weights(
+    advantages: torch.Tensor,
+    entropys: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    token_weight_min: float = 0.8,
+    token_weight_max: float = 1.0,
+    linear: bool = False,
+    mode: str = "symmetric",
+) -> torch.Tensor:
+    """STEER's released token proxy, using cached old-policy entropy.
+
+    Min/max normalization is local to this micro-batch. The proxy omits the
+    clipping indicator, as in the original implementation. Exponential mappings
+    retain its 0.02 denominator floor; symmetric exponential ignores the upper
+    bound and maps to [token_weight_min, 1]. All intermediate math is FP32.
+    """
+    if not math.isfinite(token_weight_min) or not 0 < token_weight_min <= 1:
+        raise ValueError("STEER token_weight_min must be in (0, 1].")
+    if not math.isfinite(token_weight_max) or token_weight_max < token_weight_min:
+        raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
+    if mode not in ("symmetric", "asymmetric"):
+        raise ValueError("STEER mode must be symmetric or asymmetric.")
+    if not linear and token_weight_max < 1:
+        raise ValueError("STEER exponential mapping requires token_weight_max >= 1.")
+
+    tensors = (advantages, entropys, old_log_prob, log_prob)
+    if any(t.shape != response_mask.shape for t in tensors):
+        raise ValueError("STEER inputs must have the same [batch, response_length] shape.")
+    valid = response_mask.bool()
+    weights = torch.zeros_like(log_prob, dtype=torch.float32)
+    if not valid.any():
+        return weights
+
+    advantage, entropy, old_logp, logp = (t.detach().float()[valid] for t in tensors)
+    if not all(torch.isfinite(t).all() for t in (advantage, entropy, old_logp, logp)):
+        raise ValueError("STEER received non-finite inputs on valid response tokens.")
+    # Clamp log probabilities before exp to avoid overflow on malformed inputs.
+    p = logp.clamp(max=0).exp().clamp(min=1e-8, max=1.0 - 1e-8)
+    old_p = old_logp.clamp(max=0).exp().clamp(min=1e-8, max=1.0)
+    metric = (advantage / old_p) * p * (1 - p) * (p.log() + entropy)
+    if not torch.isfinite(metric).all():
+        raise ValueError("STEER entropy-change proxy overflowed on valid response tokens.")
+    metric = -metric if mode == "asymmetric" else metric.abs()
+    metric_min, metric_max = metric.min(), metric.max()
+
+    if linear:
+        if metric_max > metric_min:
+            fraction = (metric - metric_min) / (metric_max - metric_min)
+            if mode == "symmetric":
+                fraction = 1 - fraction
+            valid_weights = token_weight_min + (token_weight_max - token_weight_min) * fraction
+        else:
+            valid_weights = torch.full_like(metric, (token_weight_min + token_weight_max) / 2)
+        valid_weights = valid_weights.clamp(min=token_weight_min, max=token_weight_max)
+    else:
+        scale = -math.log(token_weight_min) / metric.abs().max().clamp(min=0.02)
+        exponent = scale * metric if mode == "asymmetric" else -scale * metric
+        upper = token_weight_max if mode == "asymmetric" else 1.0
+        valid_weights = exponent.exp().clamp(min=token_weight_min, max=upper)
+    weights[valid] = valid_weights
+    return weights
+
+
+@register_policy_loss("entropy_control")
+def compute_policy_loss_with_entropy(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+    *,
+    entropys: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Weight the native dual-clip PPO loss without differentiating through STEER.
+
+    ``entropys`` must be the response-aligned cached entropy of the proximal old
+    policy, not the current model output. Rollout IS weights remain independent.
+    """
+    if config is None or entropys is None:
+        raise ValueError("STEER requires actor config and cached old-policy entropys.")
+    policy = config.policy_loss
+    weights = compute_token_weights(
+        advantages,
+        entropys,
+        old_log_prob,
+        log_prob,
+        response_mask,
+        token_weight_min=policy.token_weight_min,
+        token_weight_max=policy.token_weight_max,
+        linear=policy.linear,
+        mode=policy.entropy_control_mode,
+    )
+    valid = response_mask.bool()
+    if not valid.any():
+        # Keep a differentiable zero even on a fully rejected local micro-batch.
+        zero = torch.where(valid, log_prob, 0.0).sum() * 0
+        return zero, {"actor/pg_clipfrac": 0.0, "actor/ppo_kl": 0.0, "actor/pg_clipfrac_lower": 0.0}
+
+    safe_logp = torch.where(valid, log_prob, 0.0)
+    safe_old_logp = torch.where(valid, old_log_prob, 0.0)
+    safe_advantages = torch.where(valid, advantages, 0.0)
+    combined_weights = weights
+    if rollout_is_weights is not None:
+        combined_weights = weights * torch.where(valid, rollout_is_weights, 0.0)
+    loss, metrics = compute_policy_loss_vanilla(
+        safe_old_logp,
+        safe_logp,
+        safe_advantages,
+        response_mask,
+        loss_agg_mode=loss_agg_mode,
+        config=config,
+        rollout_is_weights=combined_weights,
+    )
+    valid_weights = weights[valid]
+    metrics.update(
+        {
+            "actor/token_weights_microbatch_mean": valid_weights.mean().item(),
+            "actor/token_weights_min": valid_weights.min().item(),
+            "actor/token_weights_max": valid_weights.max().item(),
+        }
+    )
+    return loss, metrics
 
 
 @register_policy_loss("dppo_tv")

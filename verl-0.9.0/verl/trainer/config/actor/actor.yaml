@@ -57,7 +57,7 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
+  # Registered policy loss name; use entropy_control for STEER.
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -78,6 +78,18 @@ policy_loss:
   # Quadratic log-ratio penalty coefficient for Direct Reward Optimization.
   # Must be set to a positive value when policy_loss.loss_mode is "dro".
   dro_beta: null
+
+  # STEER lower weight bound; 0.8 matches the released exponential recipe.
+  token_weight_min: 0.8
+
+  # STEER upper bound (symmetric exponential mapping always has upper bound 1).
+  token_weight_max: 1.0
+
+  # STEER mapping: false for exponential, true for linear.
+  linear: false
+
+  # STEER controls the magnitude of entropy change by default.
+  entropy_control_mode: symmetric
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

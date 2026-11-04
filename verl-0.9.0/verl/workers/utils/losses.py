@@ -83,7 +83,15 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
     fields = ["response_mask", "old_log_probs", "advantages"]
+    entropy_key = None
+    if loss_mode == "entropy_control":
+        # V1 stores response-only nested entropy; V0 uses padded "entropys".
+        entropy_key = "entropy" if "entropy" in data else "entropys"
+        if entropy_key not in data:
+            raise ValueError("STEER requires cached old-policy entropy in the training batch.")
+        fields.append(entropy_key)
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -98,9 +106,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     loss_agg_mode = config.loss_agg_mode
 
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
-
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    loss_kwargs = {"entropys": data[entropy_key]} if entropy_key is not None else {}
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
@@ -109,11 +116,19 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **loss_kwargs,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens
     # Ex: in compute_policy_loss_vanilla, pg_metrics are pg_clipfrac, ppo_kl, pg_clipfrac_lower
     pg_metrics = Metric.from_dict(pg_metrics, aggregation=AggregationType.MEAN)
+    if loss_mode == "entropy_control":
+        for key, aggregation in (
+            ("actor/token_weights_min", AggregationType.MIN),
+            ("actor/token_weights_max", AggregationType.MAX),
+        ):
+            if key in pg_metrics:
+                pg_metrics[key].aggregation = aggregation
 
     metrics.update(pg_metrics)
     metrics["actor/pg_loss"] = Metric(value=pg_loss, aggregation=metric_aggregation)
