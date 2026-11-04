@@ -20,7 +20,6 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
-import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1377,6 +1376,24 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+def _steer_masked_mean(values, mask, axis=None):
+    # Preserve the old reduction (including its treatment of masked NaNs).
+    return (values * mask).sum(axis=axis) / (mask.sum(axis=axis) + 1e-8)
+
+
+def agg_steer_loss(loss_mat, loss_mask, loss_agg_mode):
+    """Old STEER micro-batch aggregation, without global token normalization."""
+    if loss_agg_mode == "token-mean":
+        return _steer_masked_mean(loss_mat, loss_mask)
+    if loss_agg_mode == "seq-mean-token-sum":
+        return (loss_mat * loss_mask).sum(dim=-1).mean()
+    if loss_agg_mode == "seq-mean-token-mean":
+        return ((loss_mat * loss_mask).sum(dim=-1) / loss_mask.sum(dim=-1)).mean()
+    if loss_agg_mode == "seq-mean-token-sum-norm":
+        return (loss_mat * loss_mask).sum() / loss_mask.shape[-1]
+    raise ValueError(f"Invalid old STEER loss_agg_mode: {loss_agg_mode}")
+
+
 @torch.no_grad()
 def compute_token_weights(
     advantages: torch.Tensor,
@@ -1385,62 +1402,64 @@ def compute_token_weights(
     log_prob: torch.Tensor,
     response_mask: torch.Tensor,
     token_weight_min: float = 0.8,
-    token_weight_max: float = 1.0,
-    linear: bool = False,
+    token_weight_max: float = 1.2,
+    linear: bool = True,
     mode: str = "symmetric",
 ) -> torch.Tensor:
-    """STEER's released token proxy, using cached old-policy entropy.
-
-    Min/max normalization is local to this micro-batch. The proxy omits the
-    clipping indicator, as in the original implementation. Exponential mappings
-    retain its 0.02 denominator floor; symmetric exponential ignores the upper
-    bound and maps to [token_weight_min, 1]. All intermediate math is FP32.
-    """
-    if not math.isfinite(token_weight_min) or not 0 < token_weight_min <= 1:
-        raise ValueError("STEER token_weight_min must be in (0, 1].")
-    if not math.isfinite(token_weight_max) or token_weight_max < token_weight_min:
-        raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
-    if mode not in ("symmetric", "asymmetric"):
-        raise ValueError("STEER mode must be symmetric or asymmetric.")
-    if not linear and token_weight_max < 1:
-        raise ValueError("STEER exponential mapping requires token_weight_max >= 1.")
-
-    tensors = (advantages, entropys, old_log_prob, log_prob)
-    if any(t.shape != response_mask.shape for t in tensors):
-        raise ValueError("STEER inputs must have the same [batch, response_length] shape.")
-    valid = response_mask.bool()
-    weights = torch.zeros_like(log_prob, dtype=torch.float32)
-    if not valid.any():
-        return weights
-
-    advantage, entropy, old_logp, logp = (t.detach().float()[valid] for t in tensors)
-    if not all(torch.isfinite(t).all() for t in (advantage, entropy, old_logp, logp)):
-        raise ValueError("STEER received non-finite inputs on valid response tokens.")
-    # Clamp log probabilities before exp to avoid overflow on malformed inputs.
-    p = logp.clamp(max=0).exp().clamp(min=1e-8, max=1.0 - 1e-8)
-    old_p = old_logp.clamp(max=0).exp().clamp(min=1e-8, max=1.0)
-    metric = (advantage / old_p) * p * (1 - p) * (p.log() + entropy)
-    if not torch.isfinite(metric).all():
-        raise ValueError("STEER entropy-change proxy overflowed on valid response tokens.")
-    metric = -metric if mode == "asymmetric" else metric.abs()
-    metric_min, metric_max = metric.min(), metric.max()
-
-    if linear:
-        if metric_max > metric_min:
-            fraction = (metric - metric_min) / (metric_max - metric_min)
-            if mode == "symmetric":
-                fraction = 1 - fraction
-            valid_weights = token_weight_min + (token_weight_max - token_weight_min) * fraction
+    """Released STEER proxy and mappings, preserving input-dtype math and fallback."""
+    with torch.no_grad():
+        x = torch.exp(log_prob)
+        x = torch.clamp(x, min=1e-08, max=1.0 - 1e-08)
+        x_one_minus_x_squared = x * (1 - x)
+        ln_x_plus_h = torch.log(x) + entropys
+        f_x = x_one_minus_x_squared * ln_x_plus_h
+        old_prob = torch.exp(old_log_prob)
+        old_prob = torch.clamp(old_prob, min=1e-08, max=1.0)
+        advantage_over_old_prob = advantages / old_prob
+        if mode == "asymmetric":
+            metric = -advantage_over_old_prob * f_x
         else:
-            valid_weights = torch.full_like(metric, (token_weight_min + token_weight_max) / 2)
-        valid_weights = valid_weights.clamp(min=token_weight_min, max=token_weight_max)
-    else:
-        scale = -math.log(token_weight_min) / metric.abs().max().clamp(min=0.02)
-        exponent = scale * metric if mode == "asymmetric" else -scale * metric
-        upper = token_weight_max if mode == "asymmetric" else 1.0
-        valid_weights = exponent.exp().clamp(min=token_weight_min, max=upper)
-    weights[valid] = valid_weights
-    return weights
+            metric = advantage_over_old_prob * f_x
+        if not torch.isfinite(metric).all():
+            print("[Token Weighting] Warning: Found non-finite values in metric")
+            metric = torch.where(torch.isfinite(metric), metric, torch.zeros_like(metric))
+        if mode == "symmetric":
+            metric = torch.abs(metric)
+        valid_metric = metric[response_mask.bool()]
+        if valid_metric.numel() == 0:
+            return torch.zeros_like(response_mask, dtype=torch.float)
+        metric_min = valid_metric.min()
+        metric_max = valid_metric.max()
+        token_weights = torch.zeros_like(metric, dtype=torch.float)
+        valid_mask = response_mask.bool()
+        if valid_mask.any():
+            valid_metric = metric[valid_mask]
+            if linear:
+                if metric_max > metric_min:
+                    scale_factor = (token_weight_max - token_weight_min) / (metric_max - metric_min)
+                    if mode == "asymmetric":
+                        valid_weights = token_weight_min + (valid_metric - metric_min) * scale_factor
+                    else:
+                        valid_weights = token_weight_max - (valid_metric - metric_min) * scale_factor
+                else:
+                    valid_weights = torch.full_like(valid_metric, (token_weight_min + token_weight_max) / 2)
+                valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=token_weight_max)
+            elif mode == "asymmetric":
+                abs_max = torch.maximum(
+                    valid_metric.abs().max(), torch.tensor(0.02, dtype=metric.dtype, device=metric.device)
+                )
+                k = -torch.log(torch.tensor(token_weight_min, dtype=metric.dtype, device=metric.device)) / abs_max
+                valid_weights = torch.exp(k * valid_metric)
+                valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=token_weight_max)
+            else:
+                k = -torch.log(
+                    torch.tensor(token_weight_min, dtype=metric.dtype, device=metric.device)
+                ) / torch.maximum(metric_max, torch.tensor(0.02, dtype=metric.dtype, device=metric.device))
+                valid_weights = torch.exp(-k * valid_metric)
+                valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=1.0)
+            token_weights[valid_mask] = valid_weights
+        token_weights = token_weights * response_mask.float()
+        return token_weights
 
 
 @register_policy_loss("entropy_control")
@@ -1455,13 +1474,15 @@ def compute_policy_loss_with_entropy(
     *,
     entropys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Weight the native dual-clip PPO loss without differentiating through STEER.
+    """Released STEER loss under the 0.9.0 registry signature.
 
-    ``entropys`` must be the response-aligned cached entropy of the proximal old
-    policy, not the current model output. Rollout IS weights remain independent.
+    Aggregation is local, as in the old actor. The loss bridge applies the old
+    gradient-accumulation scaling. Cached entropy is not current model entropy.
     """
     if config is None or entropys is None:
         raise ValueError("STEER requires actor config and cached old-policy entropys.")
+    if rollout_is_weights is not None:
+        raise ValueError("The old STEER loss does not use rollout IS weights.")
     policy = config.policy_loss
     weights = compute_token_weights(
         advantages,
@@ -1474,35 +1495,29 @@ def compute_policy_loss_with_entropy(
         linear=policy.linear,
         mode=policy.entropy_control_mode,
     )
-    valid = response_mask.bool()
-    if not valid.any():
-        # Keep a differentiable zero even on a fully rejected local micro-batch.
-        zero = torch.where(valid, log_prob, 0.0).sum() * 0
-        return zero, {"actor/pg_clipfrac": 0.0, "actor/ppo_kl": 0.0, "actor/pg_clipfrac_lower": 0.0}
-
-    safe_logp = torch.where(valid, log_prob, 0.0)
-    safe_old_logp = torch.where(valid, old_log_prob, 0.0)
-    safe_advantages = torch.where(valid, advantages, 0.0)
-    combined_weights = weights
-    if rollout_is_weights is not None:
-        combined_weights = weights * torch.where(valid, rollout_is_weights, 0.0)
-    loss, metrics = compute_policy_loss_vanilla(
-        safe_old_logp,
-        safe_logp,
-        safe_advantages,
-        response_mask,
-        loss_agg_mode=loss_agg_mode,
-        config=config,
-        rollout_is_weights=combined_weights,
-    )
-    valid_weights = weights[valid]
-    metrics.update(
-        {
-            "actor/token_weights_microbatch_mean": valid_weights.mean().item(),
-            "actor/token_weights_min": valid_weights.min().item(),
-            "actor/token_weights_max": valid_weights.max().item(),
-        }
-    )
+    clip_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
+    clip_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
+    assert config.clip_ratio_c > 1.0
+    difference = (log_prob - old_log_prob).clamp(min=-20.0, max=20.0)
+    ratio = difference.exp()
+    losses1 = -advantages * ratio
+    losses2 = -advantages * ratio.clamp(1 - clip_low, 1 + clip_high)
+    clipped = torch.maximum(losses1, losses2)
+    dual = torch.min(-advantages * config.clip_ratio_c, clipped)
+    losses = torch.where(advantages < 0, dual, clipped)
+    loss = agg_steer_loss(losses * weights, response_mask, loss_agg_mode)
+    valid_weights = weights[response_mask > 0]
+    metrics = {
+        "actor/pg_clipfrac": _steer_masked_mean((losses2 > losses1).float(), response_mask).item(),
+        "actor/ppo_kl": _steer_masked_mean(-difference, response_mask).item(),
+        "actor/pg_clipfrac_lower": _steer_masked_mean(
+            (clipped > -advantages * config.clip_ratio_c) * (advantages < 0).float(),
+            response_mask,
+        ).item(),
+        "actor/token_weights_microbatch_mean": valid_weights.mean().item(),
+        "actor/token_weights_min": valid_weights.min().item(),
+        "actor/token_weights_max": valid_weights.max().item(),
+    }
     return loss, metrics
 
 

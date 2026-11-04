@@ -92,7 +92,7 @@ class PolicyLossConfig(BaseConfig):
         ppo_kl_coef (float): KL divergence penalty coefficient.
         dro_beta (Optional[float]): Quadratic log-ratio penalty for DRO. Required when loss_mode is 'dro'.
         rollout_correction (RolloutCorrectionConfig): Configuration for rollout correction.
-        token_weight_min (float): STEER lower bound; 0.8 matches the released recipe.
+        token_weight_min (float): STEER lower bound; default matches the old actor fallback.
         token_weight_max (float): STEER upper bound; symmetric exponential always uses 1.
         linear (bool): Use the released linear mapping instead of exponential mapping.
         entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
@@ -106,9 +106,9 @@ class PolicyLossConfig(BaseConfig):
     ppo_kl_coef: float = 0.1
     dro_beta: Optional[float] = None
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
-    token_weight_min: float = 0.8
-    token_weight_max: float = 1.0
-    linear: bool = False
+    token_weight_min: float = 0.95
+    token_weight_max: float = 1.05
+    linear: bool = True
     entropy_control_mode: str = "symmetric"
 
     def __post_init__(self):
@@ -120,8 +120,6 @@ class PolicyLossConfig(BaseConfig):
             raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
         if self.entropy_control_mode not in ("symmetric", "asymmetric"):
             raise ValueError("STEER entropy_control_mode must be symmetric or asymmetric.")
-        if not self.linear and self.token_weight_max < 1:
-            raise ValueError("STEER exponential mapping requires token_weight_max >= 1.")
 
 
 @dataclass

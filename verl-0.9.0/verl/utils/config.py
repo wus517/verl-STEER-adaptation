@@ -93,6 +93,13 @@ def validate_config(
             raise ValueError("STEER currently supports the V1 sync trainer only.")
         if OmegaConf.select(config, "distillation.enabled", default=False):
             raise ValueError("STEER with distillation is not supported.")
+        if config.actor_rollout_ref.actor.strategy not in ("fsdp", "fsdp2"):
+            raise ValueError("STEER legacy gradient accumulation currently supports fsdp/fsdp2 only.")
+        for key in ("rollout_is", "rollout_rs"):
+            if OmegaConf.select(config, f"algorithm.rollout_correction.{key}") is not None:
+                raise ValueError(f"STEER follows the old loss without rollout correction ({key}).")
+        if config.actor_rollout_ref.actor.loss_agg_mode == "token-sum":
+            raise ValueError("STEER follows the old aggregation modes; token-sum was not supported.")
 
     if not config.actor_rollout_ref.actor.use_dynamic_bsz:
         if config.actor_rollout_ref.actor.strategy == "megatron":

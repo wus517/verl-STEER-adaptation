@@ -2,7 +2,7 @@
 
 > 记录日期：2026-11-04。当前阶段：STEER 算法核心已适配到 verl 0.9.0，CPU 验证通过；实际 NPU 训练尚未验证。
 > 目的：后续会话先读本文，再沿文中的函数定位继续工作，避免把论文定义、旧实现行为和适配建议混在一起。
-> 第 2–9 节以初始调研为基础；当前实现和验证状态见第 11 节。用户最新要求：仅适配算法，不处理实验配置、启动脚本或奖励函数；后续训练目标为 NPU + Qwen3.5-9B。
+> 第 2–9 节保留初始调研与历史建议；当前实现和验证状态见第 11 节。用户最新决定：**有差异的地方以旧版为准**；该决定覆盖历史建议中的 FP32 强转、全局 loss 归一化、当前熵正则和 rollout IS 扩展。仅适配算法，不处理实验配置、启动脚本或奖励函数；后续训练目标为 NPU + Qwen3.5-9B。
 
 ## 1. 结论与后续工作入口
 
@@ -12,7 +12,7 @@ STEER 是在现有策略梯度算法上增加 **token 级、停止梯度的自�
 
 1. `verl/workers/config/actor.py` 和 `verl/trainer/config/actor/actor.yaml`：增加有类型的 STEER 配置。
 2. `verl/trainer/ppo/core_algos.py`：权重函数与注册的 `entropy_control` policy loss。
-3. `verl/workers/utils/losses.py::ppo_loss`：向 STEER loss 提供熵张量，保留现有全局 loss 聚合与 rollout correction。
+3. `verl/workers/utils/losses.py::ppo_loss`：提供缓存旧熵，按旧版局部聚合及梯度累积规则缩放 STEER loss；不叠加 rollout correction。
 4. 按熵来源处理 trainer 数据路径：V1 已存储旧熵 `entropy`；V0 兼容路径会删除 `entropys`，需要有条件保留。
 5. 增加算法数值和接口验证。训练 recipe、奖励适配入口按用户最新指示不纳入本次改动。
 
@@ -258,13 +258,13 @@ prompt batch -> 为每个 prompt 建 uid -> 每个 prompt 采样 n 条回答
 
 旧 actor 的 STEER 正常路径直接使用缓存熵；它的缺失熵 fallback 在 `entropy_coeff=0` 时不会计算熵，而且字段选择本身要求 `entropys`。因此不是可靠的“缺失时自动重算”机制。迁移后缺失必需张量应明确报错。
 
-若同时开启 entropy regularization，缓存旧熵也不能提供有效的当前策略熵梯度；旧主脚本 `entropy_coeff=0` 避开了这个问题。迁移时需区分“STEER 只读的旧熵”和“正则项所需的可微当前熵”。
+若同时开启 entropy regularization，缓存旧熵也不能提供有效的当前策略熵梯度；旧主脚本 `entropy_coeff=0` 避开了这个问题。按用户“以旧版为准”的决定，迁移后保留此行为，不能自行换成可微当前熵。
 
 ### 5.3 归一化范围与 batch 单位
 
 旧权重函数是在 `update_policy` 的 micro-batch 循环内调用，因此 min/max 是 **单 DP rank、单 micro-batch 的有效回答 token** 范围，没有跨 rank all-reduce，也没有跨整个 optimizer mini-batch 统一最大值。
 
-这意味着改变 GPU 数、micro-batch size、动态分批或样本重排，可能改变权重本身。新版正确的全局 loss 分母只能解决 loss 缩放问题，**不会自动让局部权重的 min/max 对分批不变**。
+这意味着改变设备数、micro-batch size、动态分批或样本重排，可能改变权重本身。旧版局部 token mean 与新版全局 token mean 在变长回答上也会产生不同梯度；当前 STEER 同时保留旧权重范围和旧 loss 缩放规则。
 
 旧脚本 `ppo_mini_batch_size=32` 的单位也要注意：旧 FSDP worker 会乘 `rollout.n` 再除 DP size；新版 trainer 同样先乘 `rollout.n`。当 `n=8, DP=8, SP=1` 时：
 
@@ -407,7 +407,7 @@ V1 `_step_once`（536 起）依次采样、奖励、balance、old logprob、可�
 
 所以只在 `core_algos.py` 注册旧函数不够：旧函数参数多一个熵张量、没有新版 config/rollout_is_weights 契约，返回值也不兼容。建议只对 `entropy_control` 分支增加 entropy kwargs，其他注册 loss 不受影响；避免无差别向所有函数传入新参数。
 
-### 8.5 全局 loss 缩放不能丢
+### 8.5 新版全局 loss 缩放与旧版的区别
 
 新版 [core_algos.py](verl-0.9.0/verl/trainer/ppo/core_algos.py)：`compute_policy_loss_vanilla` 1286–1376 与旧 PPO 主体相同，但支持 `rollout_is_weights`，返回 `(pg_loss, pg_metrics)`，并调用：
 
@@ -421,9 +421,9 @@ agg_loss(..., **config.global_batch_info)
 loss_micro = sum(M·l·λ [·rollout_is_weights]) / global_valid_tokens · dp_size
 ```
 
-FSDP 梯度平均与 micro-batch 梯度累积共同还原全局 token mean。不要恢复旧 actor 手动除 gradient accumulation 或按局部 batch size 缩放的做法，也不要用 `sum(Mλ)` 替代原分母。
+以上是 0.9.0 原生 loss 的语义。**当前 STEER 按用户决定不采用该分母**：恢复旧 actor 的局部 loss、静态累积除数和动态样本数比例，然后由 FSDP 对 DP 梯度平均。其他算法保持 0.9.0 原生聚合。不使用 `sum(Mλ)` 作分母。
 
-如启用 rollout correction，STEER 权重与 IS 权重应分别计算、在 token loss 上相乘；`p_old` 仍应对应 proximal old actor，不能擅自换成 `π_rollout`。第一阶段显式保持 `bypass_mode=false`；bypass 会跳过旧熵计算，也改变策略语义，应先拒绝不受支持的组合。
+旧代码没有新版 rollout IS/RS；当前 STEER 显式拒绝这些组合和 bypass，避免改变旧算法。将来只有用户明确要求研究扩展时再另行实现。
 
 ### 8.6 配置、引擎与依赖
 
@@ -436,6 +436,8 @@ FSDP 梯度平均与 micro-batch 梯度累积共同还原全局 token mean。不
 - 目标 setup 的 vLLM extra 要求 `vllm>=0.18.0`，旧 requirements 仅注释 `vllm==0.8.4`；目标默认 rollout.mode 为 async serving。环境应按本地 0.9.0 文档和后端要求重新配，不是复制旧依赖锁定。
 
 ## 9. 初始分阶段适配计划（当前进度见第 11 节）
+
+> 本节为历史计划。用户随后要求算法差异以旧版为准，以下关于 FP32、空 mask 安全化、全局梯度不变性及 IS 的建议均未作为最终语义；最终验收标准见第 11 节。阶段 C 的实验工作仍不在范围内。
 
 ### 阶段 A：先固定第一版语义
 
@@ -513,7 +515,7 @@ FSDP 梯度平均与 micro-batch 梯度累积共同还原全局 token mean。不
 后续继续工作时按顺序执行：
 
 1. 读本文第 1、6、8、9 节，检查工作区是否已有新改动。
-2. 阅读第 11 节，沿已完成的旧实现兼容方案继续；不要再次从头移植或擅自替换成当前熵版本。
+2. 阅读第 11 节，沿已完成的旧实现兼容方案继续；有差异以旧版为准，不要从头移植或擅自替换成当前熵、全局 token mean、FP32 proxy 或 rollout IS 版本。
 3. 用户明确限定当前只做算法适配；不新增实验配置、启动脚本、数据集奖励函数或依赖安装脚本。
 4. 后续若用户要求运行验证，再在 NPU + Qwen3.5-9B 上确认训练链路。
 5. 将实际修改、测试结果、语义取舍更新回本文。
@@ -535,60 +537,90 @@ verl-0.9.0/verl/workers/utils/losses.py
 c6dfeb10900054e96b432633b975f3e3a535d3358a4ad13eeda9f730c5942d4a
 ```
 
-## 11. 已完成的算法适配（2026-11-04）
+## 11. 当前适配：以旧版为准（2026-11-04）
 
-### 11.1 文件与调用链
+### 11.1 用户决定与范围
 
-| 文件 | 实际改动 |
+用户在差异审查后明确决定：**“有差异的地方以旧版为准。”** 以 `STEER-main` 的数学和 actor 更新行为作为本次适配依据，论文用于理解和解释旧实现的近似。旧源码不修改。只适配 `verl-0.9.0` 的算法路径，不处理实验 recipe、启动脚本、奖励迁移或环境安装。
+
+原先第一版迁移采用的 FP32 proxy、全局 token/sequence 分母、当前熵正则、附加 rollout IS 以及全空 mask 安全返回，均已撤回。先前的 21 项测试把新版 `agg_loss` 注入旧函数，不能证明完整旧版聚合一致；当前测试从旧源码独立提取 `agg_loss` 和旧 masked reductions，不再借用新版归约。
+
+### 11.2 已固定的语义
+
+| 项目 | 当前 STEER 行为 |
 | --- | --- |
-| `verl-0.9.0/verl/workers/config/actor.py` | `PolicyLossConfig` 新增 `token_weight_min/max`、`linear`、`entropy_control_mode`，并对 STEER 参数做有限值/范围/模式校验 |
-| `verl-0.9.0/verl/trainer/config/actor/actor.yaml` | 暴露算法字段，普通 loss 仍默认为原值；没有增加实验 recipe |
-| `verl-0.9.0/verl/trainer/ppo/core_algos.py` | `compute_token_weights` 和注册名为 `entropy_control` 的 `compute_policy_loss_with_entropy` |
-| `verl-0.9.0/verl/workers/utils/losses.py` | `ppo_loss` 条件读取缓存旧熵并转成 response padded 张量；仅 STEER 收到额外参数；权重 min/max 使用 MIN/MAX 聚合 |
-| `verl-0.9.0/verl/trainer/ppo/ray_trainer.py` | V0 兼容分支在 STEER 模式下保留 `entropys` |
-| `verl-0.9.0/verl/utils/config.py` | 对 bypass、V1 非 sync、蒸馏组合显式报错，避免使用错误熵或不完整训练链路 |
-| `verl-0.9.0/tests/trainer/ppo/test_steer_on_cpu.py` | 算法对照、梯度、mask、聚合、混合精度与真实 loss bridge 测试 |
+| 熵来源 | 更新前缓存的 `H_old`；当前采样 token 概率随 actor 更新变化 |
+| proxy | 按旧源码运算顺序计算，不补论文的动作期望、η/L 或 clipping 指示器 |
+| dtype | 保留输入 dtype 的指数、clamp、log 等计算；不强制中间量 FP32；输出权重仍是旧版的 FP32 |
+| 非有限 proxy | 旧版警告后逐元素置零，再做绝对值及映射；不改成异常退出 |
+| 归一化范围 | 单 DP rank、单 micro-batch 有效 token 的 min/max；不跨卡或跨 micro-batch 汇总 |
+| 映射 | symmetric/asymmetric × linear/exponential 四分支；保留指数分母 floor=0.02 及原算术顺序 |
+| actor 默认参数 | `token_weight_min=0.95, token_weight_max=1.05, linear=true, entropy_control_mode=symmetric`，匹配旧 actor fallback |
+| 独立 helper 默认 | `0.8/1.2/linear=true`，保留旧 helper 默认；旧 exp recipe 的 `0.8/1.0/false` 不能冒充 actor 默认 |
+| PPO | 旧 clipped + dual-clip 计算，权重乘最终 token loss；不除以权重和 |
+| 静态梯度累积 | 每个 micro-batch 的局部 loss 除以 `local_mini_batch_size // ppo_micro_batch_size_per_gpu` |
+| 动态梯度累积 | 每个局部 loss 乘 `len(micro_batch) / local_mini_batch_size` |
+| DP | FSDP 对各 rank 累计梯度做平均；STEER 不使用新版全局 token 分母 |
+| 熵正则 | 非零 entropy_coeff 时也用 detached 缓存旧熵，影响 loss 数值但无当前熵梯度；保留旧行为 |
+| KL 正则 | 旧 KL 公式和局部聚合，随后应用相同累积缩放；不采用新版 `k3+` 等 straight-through 变体 |
+| rollout correction | 拒绝 IS/RS/bypass，不悄悄乘额外权重或筛掉旧算法原有样本 |
+| 边界情况 | helper 对全空 mask 返回零；loss 后续 min/max 仍会失败。全 BF16 或全 FP64 输入写入 FP32 权重的 dtype 错误也按旧版保留 |
 
-算法选择入口为已有字段 `actor_rollout_ref.actor.policy_loss.loss_mode=entropy_control`。
-四个新算法字段均在 `actor_rollout_ref.actor.policy_loss` 下，不是旧版 actor 顶层字段。
-默认 `token_weight_min=0.8`、`token_weight_max=1.0`、`linear=false`、`entropy_control_mode=symmetric`；这些是算法默认值，未修改任何实验启动配置。
+四种旧聚合精确为（`M` 是 response mask，`L` 是 padded response 宽度）：
 
-V1 调用链：`_compute_old_log_prob` 缓存 `entropy` → TransferQueue → unified training worker → `ppo_loss` → `get_policy_loss_fn("entropy_control")` → 新 loss → 原生 `compute_policy_loss_vanilla`。
-V1 训练器无需额外修改：它原本就计算完整词表条件熵，并通过 `response_from_nested` 将旧熵变成 response-only nested 张量。进入 loss 时只转 padded，不再次左移。
+```text
+token-mean:               sum(loss*M) / (sum(M)+1e-8)
+seq-mean-token-sum:       mean_batch(sum_token(loss*M))
+seq-mean-token-mean:      mean_batch(sum_token(loss*M)/sum_token(M))
+seq-mean-token-sum-norm:  sum(loss*M) / L
+```
 
-TransferQueue 字段传递已静态追踪：本机缓存 `transferqueue==0.1.8` 的 `kv_batch_put` 先获取已有 metadata，`client.async_put` 经 `metadata.add_fields(data)` 返回已有字段与新增字段的并集；后续写 `advantages/returns` 不会只保留这两个字段。verl 的桥接层按 metadata.fields 读取，因此旧熵可达。没有运行完整 Ray/TransferQueue 服务，不能把此静态确认当成分布式集成测试。
+最后一种在旧代码中**没有除 batch size**，当前不自行补上。V1 nested 张量局部转 padded 后可能缩短宽度，因此 loss bridge 恢复到 `rollout.response_length`，以保留旧归一化 horizon。`loss_scale_factor` 和 `global_batch_info` 不替换上述旧分母。
 
-### 11.2 已固定的实现语义
+变长例子：两个 micro-batch 各一条回答，长度为 1 和 3，单位权重且无 clipping。旧 token-mean 对四个有效 log_prob 的梯度为 `[-1/2, -1/6, -1/6, -1/6]`；全局 token mean 为四个 `-1/4`。当前已通过实际 FSDP engine 的分批和 backward 循环验证前者；模型前向与分布式 collective 在该 CPU 测试中使用替身。
 
-- 使用缓存 `H_old` 和当前采样 token 概率计算 proxy，权重路径完全停止梯度。熵正则项仍使用当前可微熵，两者互不混用。
-- 四种映射（symmetric/asymmetric × exponential/linear）保留旧实现行为；局部 rank 的 micro-batch 极值归一化、指数分母下界 `0.02`、proxy 不显式包含 clipping 指示器均保持。
-- 复用 0.9.0 原生 PPO/dual-clip；可选 rollout IS 权重与 STEER 权重相乘。loss 分母仍是有效 token/序列数量及框架全局缩放，不除以权重和。
-- 全局 loss 归一化与局部权重归一化分开处理。改变 micro-batch 划分可能改变 STEER 权重，这是兼容旧实现的预期行为。
-- 权重计算升为 FP32，返回权重保持输入所在设备；没有新增 CUDA、Triton 或 GPU 专用调用。BF16 CPU 测试不能替代 NPU 运行验证。
-- padding 在非线性运算和 min/max 前排除；有效 token 非有限输入明确报错，不沿用旧代码警告后静默清零。全 mask 的 STEER policy loss 返回可导零值。
-- 目前额外指标为 `actor/token_weights_microbatch_mean`、`actor/token_weights_min/max`。mean 明确表示 micro-batch 均值的聚合；没有声称它是全局 token 加权均值。没有增加高开销 proxy 调试张量。
-- 当前验证范围为 V1 sync unified loss bridge，并对 V0 padded entropy 做兼容测试；未验证其他 trainer/engine 的端到端运行。`trainer.v1.trainer_mode=sync` 与 rollout serving 的 async 模式不是同一个概念。
+### 11.3 文件与调用链
 
-### 11.3 验证结果与限制
+| 文件 | 改动 |
+| --- | --- |
+| `verl-0.9.0/verl/workers/config/actor.py`、`verl/trainer/config/actor/actor.yaml` | 有类型 STEER 字段和旧 actor 默认；有限值/范围/模式校验；vanilla 仍是普通默认 loss |
+| `verl-0.9.0/verl/trainer/ppo/core_algos.py` | 旧 `compute_token_weights`、独立 `agg_steer_loss`、注册 `entropy_control`；返回新版 `(loss, metrics)` 接口 |
+| `verl-0.9.0/verl/workers/engine_workers.py` | actor 更新传递 STEER 标记、原 response horizon 并关闭当前熵计算；TrainingWorker 在真正的 rank-local optimizer mini-batch 记录样本数 |
+| `verl-0.9.0/verl/workers/utils/losses.py` | V1/V0 缓存旧熵对齐；恢复 response horizon；旧局部聚合和累积缩放；旧熵及 KL 正则；不改其他 loss 的数学规则 |
+| `verl-0.9.0/verl/trainer/ppo/ray_trainer.py` | V0 保留 `entropys`；STEER 缓存 old/ref log_prob 和熵时不额外 `.float()`，其他算法保持 FP32 转换 |
+| `verl-0.9.0/verl/utils/config.py` | 拒绝 bypass、rollout IS/RS、V1 非同步、蒸馏、非 fsdp/fsdp2 和旧版不支持的 token-sum |
+| `verl-0.9.0/tests/trainer/ppo/test_steer_on_cpu.py` | 旧源码独立参考、数值/梯度、loss bridge、真实 worker mini-batch 元数据及引擎 backward 测试 |
 
-CPU 算法专项测试 **21 项通过**：
+算法入口仍为 `actor_rollout_ref.actor.policy_loss.loss_mode=entropy_control`。四个算法参数位于 `actor_rollout_ref.actor.policy_loss` 下。没有新增训练实验配置。
 
-- 从旧源码 AST 仅提取两个算法函数，与新函数比较四种映射的权重、loss 及 logprob 梯度，避免导入旧 `verl` 包。
-- 单位权重退化为原生 vanilla；包含 rollout IS、四种聚合模式与模拟 DP 全局缩放。
-- 空 mask、无效 padding 中 NaN、有效输入 NaN、指数 floor 和非对称方向、固定权重时梯度累积一致性。
-- V1 nested / V0 padded 缓存熵的真实 `ppo_loss` 调用；变长 prompt/response 的缓存与左移；entropy bonus 梯度隔离；BF16 输入权重按 FP32 计算。
-- Hydra 配置转 dataclass、注册入口、非法参数和不支持组合。
+V1 链路：`_compute_old_log_prob` → response-only nested `entropy` → TransferQueue → `ActorRolloutRefWorker.update_actor` → `TrainingWorker.train_mini_batch` 记录本地样本数 → FSDP micro-batch → `ppo_loss` → 旧 STEER 数学 → 累积缩放 → backward。
 
-原有四组回归测试 **40 项通过**：`test_core_algos_on_cpu.py`、`test_dynamic_policy_losses_on_cpu.py`、`test_loss_aggregation_on_cpu.py`、`tests/workers/config/test_actor_config_on_cpu.py`。仅出现原有 Hydra 迁移与 TP=1 警告。
-本轮修改的 Python 文件 Ruff 检查通过；`git diff --check` 通过。
+V1 原本已经缓存完整词表条件熵；cached entropy 不再次左移。模型 log_prob 经 `no_padding_2_padding` 左移一次。V0 使用 `entropys`，缺失旧熵明确报错。
 
-标准测试入口（在已有正确依赖环境内，从 `verl-0.9.0` 执行）：
+TransferQueue 字段可达性已静态追踪：本机缓存 `transferqueue==0.1.8` 的后续 put 合并 metadata 字段；写入 advantages/returns 不会删除旧 entropy。这不是 Ray/TransferQueue 分布式服务的运行验证。
+
+额外指标为 `actor/token_weights_microbatch_mean` 和 `actor/token_weights_min/max`。mean 是 micro-batch 均值聚合；min/max 分别用 MIN/MAX；不称为全局 token 加权均值。loss 指标包含旧累积缩放，按 micro-batch SUM 和 DP mean 汇总，因此日志组织与旧研究脚本不保证逐项相同。没有搬运旧 clipping 大张量调试返回值。
+
+### 11.4 验证结果与限制
+
+本轮 STEER 专项 **56 项通过**，覆盖：
+
+- 四映射 × 四聚合，和独立旧源码权重、loss 严格相等及梯度对照；输入精度和旧异常行为。
+- 变长回答经 `ppo_loss`、静态/动态 micro-batch、模拟 DP=1/2 平均，含旧熵正则及 KL 后的累计 loss/梯度对照。
+- V1 nested / V0 padded 缓存熵、变长 prompt/response 对齐、旧熵与当前熵的梯度隔离、response horizon。
+- 实际 TrainingWorker mini-batch 循环中的本地样本数，actor 更新的元数据，以及实际 FSDP engine 拆分和反向传播循环。
+- V0 old/ref 概率和熵缓存的 BF16 保留；非 STEER 继续转 FP32；Hydra、dataclass、注册和不支持组合。
+
+原有四组算法/配置回归 **40 项通过**，FSDP engine 单进程测试 **5 项通过**。额外双进程 FSDP 原有测试运行失败：本机 Gloo 报 `Cannot resolve 127.0.0.1 to a (local) address`，未能验证真实跨进程通信。没有改测试掩盖此限制。修改文件 Ruff 检查、格式检查与 `git diff --check` 通过。
+
+正常依赖环境下，从 `verl-0.9.0` 执行：
 
 ```bash
 python -m pytest -q tests/trainer/ppo/test_steer_on_cpu.py
 python -m pytest -q tests/trainer/ppo/test_core_algos_on_cpu.py tests/trainer/ppo/test_dynamic_policy_losses_on_cpu.py tests/trainer/ppo/test_loss_aggregation_on_cpu.py tests/workers/config/test_actor_config_on_cpu.py
+python -m pytest -q tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py
 ```
 
-本机没有可用 uv 可执行文件，联网安装未成功且审批服务返回错误；未安装包或修改环境。实际使用缓存内 Python 3.12 和 `/tmp/steer-test-runner.py` 将本机只读依赖目录加入 `sys.path` 后调用 pytest，关闭无关 pytest plugin 自动加载；实际 PyTorch `2.14.1` CPU、TensorDict `0.10.0`。这是离线验证方式，不是目标 NPU 环境说明，后续 Python 环境管理仍遵循仓库的 uv 要求。
+本机没有可用 uv；之前联网安装未成功且审批服务返回错误，未安装包或创建环境。本轮沿用 `/tmp/steer-test-runner.py`，从本机只读缓存加载 Python 3.12、PyTorch 2.14.1 CPU、TensorDict 0.10.0、Hydra 等依赖，关闭无关 pytest plugin 自动加载。离线 runner 已补 main guard，以允许 multiprocessing spawn；随后双进程测试停在上述 Gloo 初始化错误。后续环境管理仍按 AGENTS 使用 uv。
 
-尚未验证：NPU 上的实际前向/反向、Qwen3.5-9B 模型加载、分布式权重同步、保存恢复及训练收益。用户当前只要求算法适配，因此没有新增或保留实验配置、启动脚本、数据集奖励迁移或 verifier 依赖文件；原始 STEER 目录保持未修改。
+**未验证**：NPU 实际前向/反向、Qwen3.5-9B 加载、真实 DP/SP、完整 Ray/TransferQueue、checkpoint、训练收益。当前仅对相同输入张量与相同 micro-batch 划分验证旧数学一致；新版模型内核、动态分组和运行环境可能产生不同概率、熵或分片，不能据此承诺完整训练逐位一致。当前接入范围为同步 FSDP/FSDP2，未宣称支持 NPU MindSpeed/Megatron 引擎。

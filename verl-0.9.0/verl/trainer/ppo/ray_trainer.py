@@ -1257,7 +1257,9 @@ class RayPPOTrainer:
         # step 4. No padding to padding
         log_probs = no_padding_2_padding(log_probs, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
-        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs.float()})
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "entropy_control":
+            log_probs = log_probs.float()
+        ref_log_prob = tu.get_tensordict({"ref_log_prob": log_probs})
         ref_log_prob = DataProto.from_tensordict(ref_log_prob)
 
         return ref_log_prob
@@ -1290,7 +1292,10 @@ class RayPPOTrainer:
         if sum_pi_squared is not None:
             sum_pi_squared = no_padding_2_padding(sum_pi_squared, batch_td)
         # step 5: rebuild a tensordict and convert to dataproto
-        result = {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
+        # STEER preserves the old actor's cached input dtypes for proxy math.
+        if self.config.actor_rollout_ref.actor.policy_loss.loss_mode != "entropy_control":
+            log_probs, entropy = log_probs.float(), entropy.float()
+        result = {"old_log_probs": log_probs, "entropys": entropy}
         if routed_experts is not None:
             result["routed_experts"] = routed_experts
         if sum_pi_squared is not None:
