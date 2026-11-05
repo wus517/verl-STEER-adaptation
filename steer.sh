@@ -273,6 +273,7 @@ if [ "${NODE_RANK}" = "0" ]; then
                 actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
                 actor_rollout_ref.actor.fsdp_config.offload_policy=True \
                 actor_rollout_ref.actor.fsdp_config.forward_prefetch=True \
+                actor_rollout_ref.actor.fsdp_config.grad_sync_every_micro_batch=True \
                 actor_rollout_ref.actor.checkpoint.save_contents="['model','optimizer','extra']" \
                 actor_rollout_ref.ref.strategy=fsdp2 \
                 actor_rollout_ref.ref.fsdp_config.param_offload=True \
