@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -90,8 +91,10 @@ def test_gradient_sync_context_keeps_sync_for_final_micro_batch(monkeypatch):
     assert module.events == ["backward"]
 
 
-def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch):
+@pytest.mark.parametrize("sync_every", [False, True])
+def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch, sync_every):
     engine = _make_engine(_FSDP2Module())
+    engine.engine_config = SimpleNamespace(grad_sync_every_micro_batch=sync_every)
     engine.ulysses_sequence_parallel_size = 1
     engine.scaler = None
     engine.get_data_parallel_group = lambda: None
@@ -128,7 +131,7 @@ def test_forward_backward_batch_syncs_only_final_micro_batch(monkeypatch):
     data = TensorDict({"loss_mask": torch.ones(3)}, batch_size=[3])
     output = engine.forward_backward_batch(data, loss_function=lambda: None)
 
-    assert sync_states == [False, False, True]
+    assert sync_states == ([] if sync_every else [False, False, True])
     assert len(output) == 3
     assert all(micro_batch["loss"].grad is not None for micro_batch in micro_batches)
 

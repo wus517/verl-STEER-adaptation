@@ -1,5 +1,7 @@
 # STEER 算法、旧实现与 verl 0.9.0 适配笔记
 
+> 四象限分支更新：以下范围说明记录原 STEER 迁移阶段。`steer_quadrant_algorithm` 按用户新规格增加了四象限模式，并按后续授权新建服务器脚本；权重行为以 [STEER_QUADRANT_ALGORITHM.md](STEER_QUADRANT_ALGORITHM.md) 为准，已确认保留 `D=max(M,0.02)`。实现、测试及脚本使用方式见 [STEER_QUADRANT_IMPLEMENTATION_LOG.md](STEER_QUADRANT_IMPLEMENTATION_LOG.md)。未被新规格覆盖的训练行为继续沿用旧实现。
+
 > 记录日期：2026-11-04。当前阶段：STEER 算法核心已适配到 verl 0.9.0，CPU 验证通过；实际 NPU 训练尚未验证。
 > 目的：后续会话先读本文，再沿文中的函数定位继续工作，避免把论文定义、旧实现行为和适配建议混在一起。
 > 第 2–9 节保留初始调研与历史建议；当前实现和验证状态见第 11 节。用户最新决定：**有差异的地方以旧版为准**；该决定覆盖历史建议中的 FP32 强转、全局 loss 归一化、当前熵正则和 rollout IS 扩展。仅适配算法，不处理实验配置、启动脚本或奖励函数；后续训练目标为 NPU + Qwen3.5-9B。

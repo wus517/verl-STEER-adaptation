@@ -1462,6 +1462,61 @@ def compute_token_weights(
         return token_weights
 
 
+@torch.no_grad()
+def compute_quadrant_steer_weights(
+    advantages: torch.Tensor,
+    entropys: torch.Tensor,
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    response_mask: torch.Tensor,
+    *,
+    token_weight_min: float = 0.70,
+    entropy_band_half_width: float = 0.20,
+    entropy_weight_strength: float = 0.10,
+    quadrant_3_weight: float = 1.00,
+) -> torch.Tensor:
+    """Four-quadrant STEER with one valid micro-batch denominator max(|score|, 0.02).
+
+    Positive scores estimate entropy increase. Quadrant I keeps the released
+    symmetric exponential mapping; III has a constant weight; II/IV share a
+    piecewise boost/neutral/suppress curve. Input-dtype probability math and
+    cached entropy follow the baseline. Configuration is validated by PolicyLossConfig.
+    """
+    valid = response_mask.bool()
+    weights = torch.zeros_like(log_prob, dtype=torch.float32)
+    if not valid.any():
+        return weights
+
+    advantage = advantages[valid]
+    probability = log_prob[valid].exp().clamp(min=1e-8, max=1.0 - 1e-8)
+    old_probability = old_log_prob[valid].exp().clamp(min=1e-8, max=1.0)
+    probability_factor = probability * (1.0 - probability) * (probability.log() + entropys[valid])
+    score = -(advantage / old_probability) * probability_factor
+    score = torch.where(torch.isfinite(score), score, torch.zeros_like(score))
+
+    magnitude = score.abs()
+    denominator = torch.maximum(magnitude.max(), score.new_tensor(0.02))
+    z = magnitude / denominator
+    low = 0.5 - entropy_band_half_width
+    high = 0.5 + entropy_band_half_width
+    increasing = score > 0
+    quadrant_1 = (advantage > 0) & (score < 0)
+    quadrant_3 = (advantage < 0) & (score < 0)
+    boost = increasing & (z < low)
+    suppress = increasing & (z > high)
+
+    valid_weights = torch.ones_like(score, dtype=weights.dtype)
+    exponent_scale = -score.new_tensor(token_weight_min).log() / denominator
+    valid_weights[quadrant_1] = (
+        torch.exp(-exponent_scale * magnitude[quadrant_1]).clamp(min=token_weight_min, max=1.0).to(weights.dtype)
+    )
+    valid_weights[quadrant_3] = quadrant_3_weight
+    valid_weights[boost] = (1.0 + entropy_weight_strength * (low - z[boost]) / low).to(weights.dtype)
+    valid_weights[suppress] = (1.0 - entropy_weight_strength * (z[suppress] - high) / (1.0 - high)).to(weights.dtype)
+    weights[valid] = valid_weights
+    return weights
+
+
 @register_policy_loss("entropy_control")
 def compute_policy_loss_with_entropy(
     old_log_prob: torch.Tensor,
@@ -1484,17 +1539,30 @@ def compute_policy_loss_with_entropy(
     if rollout_is_weights is not None:
         raise ValueError("The old STEER loss does not use rollout IS weights.")
     policy = config.policy_loss
-    weights = compute_token_weights(
-        advantages,
-        entropys,
-        old_log_prob,
-        log_prob,
-        response_mask,
-        token_weight_min=policy.token_weight_min,
-        token_weight_max=policy.token_weight_max,
-        linear=policy.linear,
-        mode=policy.entropy_control_mode,
-    )
+    if policy.entropy_control_mode == "quadrant":
+        weights = compute_quadrant_steer_weights(
+            advantages,
+            entropys,
+            old_log_prob,
+            log_prob,
+            response_mask,
+            token_weight_min=policy.token_weight_min,
+            entropy_band_half_width=policy.entropy_band_half_width,
+            entropy_weight_strength=policy.entropy_weight_strength,
+            quadrant_3_weight=policy.quadrant_3_weight,
+        )
+    else:
+        weights = compute_token_weights(
+            advantages,
+            entropys,
+            old_log_prob,
+            log_prob,
+            response_mask,
+            token_weight_min=policy.token_weight_min,
+            token_weight_max=policy.token_weight_max,
+            linear=policy.linear,
+            mode=policy.entropy_control_mode,
+        )
     clip_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
     assert config.clip_ratio_c > 1.0

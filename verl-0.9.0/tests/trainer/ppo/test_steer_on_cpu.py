@@ -412,13 +412,16 @@ def test_actor_update_passes_old_entropy_and_horizon_metadata():
     assert tu.get_non_tensor_data(data, "calculate_entropy", default=None) is False
 
 
-def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
+@pytest.mark.parametrize("mode", ["symmetric", "quadrant"])
+@pytest.mark.parametrize("sync_every", [False, True])
+def test_engine_backward_keeps_old_local_token_mean(monkeypatch, mode, sync_every):
     from verl.workers.engine.fsdp import transformer_impl
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
     # Real engine splitting and backward, with model/collectives replaced by CPU
     # fixtures. The 1-token and 3-token responses each receive half the update.
     engine = object.__new__(FSDPEngine)
+    engine.engine_config = SimpleNamespace(grad_sync_every_micro_batch=sync_every)
     engine.ulysses_sequence_parallel_size = 1
     engine.scaler = None
     engine.get_data_parallel_group = lambda: None
@@ -426,7 +429,13 @@ def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
     engine._gradient_sync_context = lambda **_: nullcontext()
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    config = _config(token_weight_min=1.0, token_weight_max=1.0)
+    config = _config(
+        token_weight_min=1.0,
+        token_weight_max=1.0,
+        linear=False,
+        entropy_control_mode=mode,
+        entropy_weight_strength=0.0,
+    )
     parameters = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]], requires_grad=True)
     data = TensorDict(
         {

@@ -95,7 +95,10 @@ class PolicyLossConfig(BaseConfig):
         token_weight_min (float): STEER lower bound; default matches the old actor fallback.
         token_weight_max (float): STEER upper bound; symmetric exponential always uses 1.
         linear (bool): Use the released linear mapping instead of exponential mapping.
-        entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
+        entropy_control_mode (str): STEER symmetric, asymmetric, or quadrant weight mapping.
+        entropy_band_half_width (float): Quadrant entropy-increase neutral band half-width, in [0, 0.5).
+        entropy_weight_strength (float): Quadrant entropy-increase boost/suppression strength, in [0, 1).
+        quadrant_3_weight (float): Positive constant weight for negative-advantage entropy-decreasing tokens.
     """
 
     loss_mode: str = "vanilla"
@@ -110,6 +113,9 @@ class PolicyLossConfig(BaseConfig):
     token_weight_max: float = 1.05
     linear: bool = True
     entropy_control_mode: str = "symmetric"
+    entropy_band_half_width: float = 0.20
+    entropy_weight_strength: float = 0.10
+    quadrant_3_weight: float = 1.00
 
     def __post_init__(self):
         if self.loss_mode != "entropy_control":
@@ -118,8 +124,17 @@ class PolicyLossConfig(BaseConfig):
             raise ValueError("STEER token_weight_min must be in (0, 1].")
         if not math.isfinite(self.token_weight_max) or self.token_weight_max < self.token_weight_min:
             raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
-        if self.entropy_control_mode not in ("symmetric", "asymmetric"):
-            raise ValueError("STEER entropy_control_mode must be symmetric or asymmetric.")
+        if self.entropy_control_mode not in ("symmetric", "asymmetric", "quadrant"):
+            raise ValueError("STEER entropy_control_mode must be symmetric, asymmetric, or quadrant.")
+        if self.entropy_control_mode == "quadrant":
+            if self.linear:
+                raise ValueError("STEER quadrant mode requires linear=false (exponential quadrant I baseline).")
+            if not math.isfinite(self.entropy_band_half_width) or not 0 <= self.entropy_band_half_width < 0.5:
+                raise ValueError("STEER entropy_band_half_width must be finite and in [0, 0.5).")
+            if not math.isfinite(self.entropy_weight_strength) or not 0 <= self.entropy_weight_strength < 1:
+                raise ValueError("STEER entropy_weight_strength must be finite and in [0, 1).")
+            if not math.isfinite(self.quadrant_3_weight) or self.quadrant_3_weight <= 0:
+                raise ValueError("STEER quadrant_3_weight must be finite and positive.")
 
 
 @dataclass

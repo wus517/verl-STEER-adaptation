@@ -88,8 +88,17 @@ policy_loss:
   # STEER mapping: false for exponential, true for linear.
   linear: true
 
-  # STEER controls the magnitude of entropy change by default.
+  # STEER mapping: symmetric, asymmetric, or quadrant (requires linear=false).
   entropy_control_mode: symmetric
+
+  # Quadrant II/IV neutral interval is [0.5-half_width, 0.5+half_width].
+  entropy_band_half_width: 0.20
+
+  # Quadrant II/IV boost and suppression amplitude around weight 1; in [0, 1).
+  entropy_weight_strength: 0.10
+
+  # Quadrant III constant weight; finite and positive.
+  quadrant_3_weight: 1.00
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0
