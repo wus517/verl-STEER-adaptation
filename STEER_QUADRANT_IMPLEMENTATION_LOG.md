@@ -1,5 +1,7 @@
 # STEER 四象限适配过程记录
 
+> 本文记录原分段四象限模式。`steer_quadrant_algorithm_v2` 新增Ⅱ/Ⅳ平方助推独立模式，规格见 [STEER_QUADRANT_RECIPROCAL_BOOST.md](STEER_QUADRANT_RECIPROCAL_BOOST.md)，最新实现与验证见 [STEER_QUADRATIC_IMPLEMENTATION_LOG.md](STEER_QUADRATIC_IMPLEMENTATION_LOG.md)。原模式和原脚本继续保留。
+
 ## 当前状态与授权边界
 
 - 分支：`steer_quadrant_algorithm`。

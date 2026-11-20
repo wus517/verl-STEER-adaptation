@@ -21,6 +21,7 @@ from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import (
     compute_policy_loss_with_entropy,
     compute_quadrant_steer_weights,
+    compute_quadratic_steer_weights,
     compute_token_weights,
     get_policy_loss_fn,
 )
@@ -58,7 +59,7 @@ def _scores(scores, signs):
     return advantage, entropy, logp.clone(), logp, mask
 
 
-def _reference_weights(advantage, entropy, old, current, mask, *, wmin=0.7, d=0.2, strength=0.1, w3=1.0):
+def _reference_weights(advantage, entropy, old, current, mask, *, wmin=0.7, d=0.2, strength=0.1, w3=1.0, boost=None):
     """Independent scalar implementation of the specification, using Python math."""
     scores = []
     for a, h, old_p, p, valid in zip(
@@ -72,13 +73,18 @@ def _reference_weights(advantage, entropy, old, current, mask, *, wmin=0.7, d=0.
         score = -float(a) / old_probability * probability * (1 - probability) * (math.log(probability) + float(h))
         scores.append(score if math.isfinite(score) else 0.0)
     denominator = max(max(map(abs, scores)), 0.02)
+    positive = [score for score in scores if score > 0]
     weights = []
     for a, score, valid in zip(advantage.flatten(), scores, mask.flatten(), strict=True):
         z = abs(score) / denominator
         if not valid:
             weight = 0.0
         elif score > 0:
-            if z < 0.5 - d:
+            if boost is not None:
+                span = max(positive) - min(positive)
+                u = (score - min(positive)) / span if span > 0 else 1.0
+                weight = 1.001 + (boost - 0.001) * (1 - u) ** 2
+            elif z < 0.5 - d:
                 weight = 1 + strength * (0.5 - d - z) / (0.5 - d)
             elif z > 0.5 + d:
                 weight = 1 - strength * (z - 0.5 - d) / (0.5 - d)
@@ -126,15 +132,18 @@ def test_document_examples_and_quadrant_three_is_independent():
 
 
 @pytest.mark.parametrize("scale", [1.0, 0.01])
-def test_quadrant_one_matches_baseline_exactly_with_shared_denominator(scale):
+@pytest.mark.parametrize("quadratic", [False, True])
+def test_quadrant_one_matches_baseline_exactly_with_shared_denominator(scale, quadratic):
     inputs = _scores([scale * score for score in [-0.6, 0.1, -0.9, 1.0]], [1, 1, -1, -1])
-    quadrant = compute_quadrant_steer_weights(*inputs)
+    helper = compute_quadratic_steer_weights if quadratic else compute_quadrant_steer_weights
+    quadrant = helper(*inputs)
     symmetric = compute_token_weights(*inputs, token_weight_min=0.7, token_weight_max=1.0, linear=False)
     # Maximum magnitude comes from IV, not I. When scale=0.01, the floor
     # limits z_max to 0.5 and prevents the high-amplitude suppression region.
     torch.testing.assert_close(quadrant[:, :1], symmetric[:, :1], rtol=0, atol=0)
     assert quadrant[0, 2] == 1.0
-    assert quadrant[0, 3] == (0.9 if scale == 1.0 else 1.0)
+    expected = 1.001 if quadratic else (0.9 if scale == 1.0 else 1.0)
+    assert quadrant[0, 3] == expected
 
 
 def test_shared_max_in_quadrant_three_and_masked_extreme():
@@ -211,8 +220,9 @@ def test_zero_nonfinite_and_empty_helper():
 
 
 @pytest.mark.parametrize("mode", ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"])
-@pytest.mark.parametrize("unit_weights", [False, True])
-def test_clipped_policy_loss_and_gradient(mode, unit_weights):
+@pytest.mark.parametrize("quadratic", [False, True])
+@pytest.mark.parametrize("minimal_settings", [False, True])
+def test_clipped_policy_loss_and_gradient(mode, quadratic, minimal_settings):
     # Include clipped positive and dual-clipped negative tokens. Weights belong
     # after clipping, while their denominator includes all valid proxy scores.
     old = torch.tensor([[-2.0, -2.0, -4.0], [-1.0, -1.0, -2.0]])
@@ -221,16 +231,31 @@ def test_clipped_policy_loss_and_gradient(mode, unit_weights):
     entropy = torch.tensor([[1.5, 1.5, 3.0], [2.0, 0.2, 1.0]], requires_grad=True)
     mask = torch.tensor([[1, 1, 1], [1, 1, 0]], dtype=torch.bool)
     config = _config()
-    if unit_weights:
+    if quadratic:
+        config = replace(config, policy_loss=replace(config.policy_loss, entropy_control_mode="quadrant_quadratic"))
+    if minimal_settings:
+        # Quadratic mode has a mandatory minimum boost, so even its smallest
+        # legal strength does not reduce positive-score weights to one.
         config = replace(
             config,
             policy_loss=replace(
-                config.policy_loss, token_weight_min=1.0, entropy_weight_strength=0.0, quadrant_3_weight=1.0
+                config.policy_loss,
+                token_weight_min=1.0,
+                entropy_weight_strength=0.0,
+                entropy_boost_strength=0.001,
+                quadrant_3_weight=1.0,
             ),
         )
-        weights = torch.ones_like(current)
-    else:
-        weights = _reference_weights(advantage.detach(), entropy.detach(), old, current.detach(), mask)
+    weights = _reference_weights(
+        advantage.detach(),
+        entropy.detach(),
+        old,
+        current.detach(),
+        mask,
+        wmin=config.policy_loss.token_weight_min,
+        strength=config.policy_loss.entropy_weight_strength,
+        boost=config.policy_loss.entropy_boost_strength if quadratic else None,
+    )
     loss, _ = compute_policy_loss_with_entropy(old, current, advantage, mask, mode, config, entropys=entropy)
     expected = _reduce(_clipped(old, current, advantage) * weights, mask, mode)
     torch.testing.assert_close(loss, expected)
@@ -244,7 +269,8 @@ def test_clipped_policy_loss_and_gradient(mode, unit_weights):
 @pytest.mark.parametrize("dynamic", [False, True])
 @pytest.mark.parametrize("dp_size", [1, 2])
 @pytest.mark.parametrize("mode", ["token-mean", "seq-mean-token-sum", "seq-mean-token-mean", "seq-mean-token-sum-norm"])
-def test_loss_bridge_accumulation_and_entropy_source(nested, dynamic, dp_size, mode):
+@pytest.mark.parametrize("quadratic", [False, True])
+def test_loss_bridge_accumulation_and_entropy_source(nested, dynamic, dp_size, mode, quadratic):
     config = replace(
         _config(entropy_band_half_width=0.1, entropy_weight_strength=0.2, quadrant_3_weight=0.95),
         use_dynamic_bsz=dynamic,
@@ -254,6 +280,13 @@ def test_loss_bridge_accumulation_and_entropy_source(nested, dynamic, dp_size, m
         kl_loss_type="mse",
         kl_loss_coef=0.02,
     )
+    if quadratic:
+        config = replace(
+            config,
+            policy_loss=replace(
+                config.policy_loss, entropy_control_mode="quadrant_quadratic", entropy_boost_strength=0.37
+            ),
+        )
     lengths = [1, 3, 2]
     old = torch.tensor([[-0.8, -1.2, -1.5]] * 3)
     current = (old + torch.tensor([[0.05, -0.1, 0.15]])).requires_grad_()
@@ -310,7 +343,17 @@ def test_loss_bridge_accumulation_and_entropy_source(nested, dynamic, dp_size, m
             pad(tensors, 7)
             for tensors in (rows(old), rows(current), rows(advantage), rows(cached), rows(old - 0.2), mask_rows)
         ]
-        weights = _reference_weights(adv, ent.detach(), old_p, new_p.detach(), mask, d=0.1, strength=0.2, w3=0.95)
+        weights = _reference_weights(
+            adv,
+            ent.detach(),
+            old_p,
+            new_p.detach(),
+            mask,
+            d=0.1,
+            strength=0.2,
+            w3=0.95,
+            boost=0.37 if quadratic else None,
+        )
         reference = _reduce(_clipped(old_p, new_p, adv) * weights, mask, mode)
         reference = reference - 0.03 * _reduce(ent.detach(), mask, mode)
         reference = reference + 0.02 * _reduce(0.5 * (new_p - ref).square(), mask, mode)
@@ -475,3 +518,206 @@ def test_server_script_python_preflight(monkeypatch, linear, half_width, valid, 
     else:
         with pytest.raises(ValueError, match="STEER"):
             exec(compile(source, "server_script_preflight", "exec"), {})
+
+
+def _quadratic_policy(**kwargs):
+    fields = dict(
+        loss_mode="entropy_control", entropy_control_mode="quadrant_quadratic", linear=False, token_weight_min=0.7
+    )
+    fields.update(kwargs)
+    return PolicyLossConfig(**fields)
+
+
+def test_quadratic_document_examples_and_third_quadrant():
+    inputs = _scores([-0.6, 0.1, 0.325, 0.55, -0.9, 0.775, 1.0, 0.0], [1, 1, 1, 1, -1, -1, -1, 0])
+    actual = compute_quadratic_steer_weights(*inputs)
+    expected = torch.tensor([[0.807344, 1.2, 1.1129375, 1.05075, 1, 1.0134375, 1.001, 1]])
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+    expected[0, 4] = 0.95
+    torch.testing.assert_close(compute_quadratic_steer_weights(*inputs, quadrant_3_weight=0.95), expected)
+
+
+@pytest.mark.parametrize("scale", [1.0, 0.005])
+def test_quadratic_two_normalizations_and_mask(scale):
+    inputs = _scores([scale * x for x in [-2, 0.002, 0.01, -0.4, -100, 100, 0.0001]], [1, 1, -1, -1, 1, 1, 1])
+    inputs[-1][0, 4:] = False
+    actual = compute_quadratic_steer_weights(*inputs)
+    baseline = compute_token_weights(*inputs, token_weight_min=0.7, token_weight_max=1, linear=False)
+    torch.testing.assert_close(actual[:, :1], baseline[:, :1], rtol=0, atol=0)
+    torch.testing.assert_close(actual[:, 1:], torch.tensor([[1.2, 1.001, 1, 0, 0, 0]]))
+
+
+@pytest.mark.parametrize(
+    "scores,signs,expected",
+    [
+        ([0.1], [1], [1.001]),
+        ([0.1, 0.1], [1, -1], [1.001, 1.001]),
+        ([0.1, 0.1, 0.9, 0.9], [1, -1, 1, -1], [1.2, 1.2, 1.001, 1.001]),
+        ([-0.1, -0.5, 0], [1, -1, 0], [0.7**0.2, 1, 1]),
+    ],
+)
+def test_quadratic_equal_single_and_no_positive(scores, signs, expected):
+    torch.testing.assert_close(compute_quadratic_steer_weights(*_scores(scores, signs)), torch.tensor([expected]))
+
+
+@pytest.mark.parametrize("boost", [0.001, 0.2, 0.8, 2.0])
+def test_quadratic_independent_reference_and_parameter_range(boost):
+    _quadratic_policy(entropy_boost_strength=boost)
+    torch.manual_seed(87)
+    old = -torch.rand(4, 8) * 5 - 0.2
+    current = old + 0.3 * torch.randn_like(old)
+    advantage = torch.randn_like(old)
+    entropy = torch.rand_like(old) * 4
+    mask = torch.rand_like(old) > 0.2
+    inputs = advantage, entropy, old, current, mask
+    actual = compute_quadratic_steer_weights(*inputs, entropy_boost_strength=boost)
+    torch.testing.assert_close(actual, _reference_weights(*inputs, boost=boost))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float64])
+def test_quadratic_document_reference_and_no_grad(dtype):
+    document = Path(__file__).resolve().parents[4] / "STEER_QUADRANT_RECIPROCAL_BOOST.md"
+    sources = re.findall(r"```python\n(.*?)```", document.read_text(), re.DOTALL)
+    source = next(source for source in sources if "def compute_quadratic_steer_weights" in source)
+    namespace = {}
+    exec(compile(ast.parse(source), str(document), "exec"), namespace)
+    inputs = list(_scores([-0.6, 0.1, 0.55, 0.9, -1, 0], [1, 1, -1, -1, -1, 0]))
+    for index in range(4):
+        inputs[index] = inputs[index].to(dtype).requires_grad_()
+    actual = compute_quadratic_steer_weights(*inputs)
+    expected = namespace["compute_quadratic_steer_weights"](*inputs)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.dtype == torch.float32 and actual.device == inputs[3].device
+    assert not actual.requires_grad
+
+
+def test_quadratic_zero_nonfinite_empty():
+    inputs = list(_scores([0, 0, 0, 0], [1, -1, 0, 1]))
+    inputs[1][0, 0] = torch.nan
+    inputs[1][0, 1] = torch.inf
+    inputs[-1][0, -1] = False
+    torch.testing.assert_close(compute_quadratic_steer_weights(*inputs), torch.tensor([[1.0, 1.0, 1.0, 0.0]]))
+    inputs[-1].zero_()
+    assert compute_quadratic_steer_weights(*inputs).eq(0).all()
+
+
+def test_quadratic_three_token_example():
+    distribution = torch.tensor([0.7, 0.2, 0.1])
+    entropy = -(distribution * distribution.log()).sum()
+    logp = torch.full((1, 3), math.log(0.1))
+    # For the same sampled token, score is proportional to advantage.
+    advantage = torch.tensor([[0.2, 0.1, 0.3]])
+    score = -(advantage / logp.exp()) * logp.exp() * (1 - logp.exp()) * (logp + entropy)
+    torch.testing.assert_close(score[0, 0], torch.tensor(0.270138), rtol=1e-6, atol=1e-6)
+    weights = compute_quadratic_steer_weights(advantage, entropy.expand_as(logp), logp, logp, torch.ones_like(logp))
+    torch.testing.assert_close(weights[0, 0], torch.tensor(1.05075))
+    torch.testing.assert_close(-advantage[0, 0] * weights[0, 0], torch.tensor(-0.21015))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"linear": True},
+        {"entropy_boost_strength": 0},
+        {"entropy_boost_strength": 0.0009},
+        {"entropy_boost_strength": -1},
+        {"entropy_boost_strength": float("nan")},
+        {"entropy_boost_strength": float("inf")},
+        {"quadrant_3_weight": 0},
+        {"quadrant_3_weight": float("nan")},
+        {"token_weight_min": 0},
+        {"token_weight_min": float("inf")},
+    ],
+)
+def test_quadratic_config_validation(kwargs):
+    with pytest.raises(ValueError, match="STEER"):
+        _quadratic_policy(**kwargs)
+
+
+def test_quadratic_server_script_and_hydra_to_loss():
+    base = _server_script_overrides("run_steer_quadrant_4096.sh")
+    new = _server_script_overrides("run_steer_quadrant_quadratic_4096.sh")
+    mapping = lambda args: dict(arg.split("=", 1) for arg in args)
+    base_map, new_map = mapping(base), mapping(new)
+    assert len(new) == len(new_map)
+    prefix = "actor_rollout_ref.actor.policy_loss."
+    assert {key for key in base_map.keys() | new_map.keys() if base_map.get(key) != new_map.get(key)} == {
+        prefix + name
+        for name in (
+            "entropy_control_mode",
+            "entropy_band_half_width",
+            "entropy_weight_strength",
+            "entropy_boost_strength",
+        )
+    }
+    directory = str(Path(__file__).resolve().parents[3] / "verl/trainer/config")
+    with initialize_config_dir(config_dir=directory, version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=new)
+    validate_config(config, use_reference_policy=True, use_critic=False)
+    actor = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+    assert actor.policy_loss.entropy_control_mode == "quadrant_quadratic"
+    assert actor.policy_loss.entropy_boost_strength == 0.2
+    assert actor.policy_loss.token_weight_min == 0.7
+    assert actor.policy_loss.quadrant_3_weight == 1
+    assert not actor.policy_loss.linear
+    assert actor.engine.grad_sync_every_micro_batch
+    assert config.trainer.device == "npu"
+    assert config.data.max_response_length == config.actor_rollout_ref.rollout.response_length == 4096
+    assert config.data.max_prompt_length == 1024
+    assert actor.kl_loss_coef == 0
+    inputs = _scores([-0.6, 0.1, -0.9, 1], [1, 1, -1, -1])
+    advantage, entropy, old, current, mask = inputs
+    fn = get_policy_loss_fn(actor.policy_loss.loss_mode)
+    loss, _ = fn(old, current, advantage, mask, config=actor, entropys=entropy)
+    torch.testing.assert_close(loss, (-advantage * _reference_weights(*inputs, boost=0.2)).mean())
+
+
+@pytest.mark.parametrize("mode", ["quadrant_quadratic", "symmetric"])
+def test_quadratic_script_environment_overrides(mode):
+    args = _server_script_overrides(
+        "run_steer_quadrant_quadratic_4096.sh",
+        STEER_ENTROPY_CONTROL_MODE=mode,
+        STEER_ENTROPY_BOOST_STRENGTH="0.35",
+        STEER_QUADRANT_3_WEIGHT="0.95",
+    )
+    directory = str(Path(__file__).resolve().parents[3] / "verl/trainer/config")
+    with initialize_config_dir(config_dir=directory, version_base=None):
+        config = compose(config_name="ppo_trainer", overrides=args)
+    actor = omega_conf_to_dataclass(config.actor_rollout_ref.actor)
+    assert actor.policy_loss.entropy_control_mode == mode
+    assert actor.policy_loss.entropy_boost_strength == 0.35
+    assert actor.policy_loss.quadrant_3_weight == 0.95
+    inputs = _scores([-0.6, 0.1, -0.9, 1], [1, 1, -1, -1])
+    advantage, entropy, old, current, mask = inputs
+    loss, _ = get_policy_loss_fn(actor.policy_loss.loss_mode)(
+        old, current, advantage, mask, config=actor, entropys=entropy
+    )
+    if mode == "quadrant_quadratic":
+        expected = _reference_weights(*inputs, boost=0.35, w3=0.95)
+    else:
+        expected = compute_token_weights(*inputs, token_weight_min=0.7, token_weight_max=1, linear=False)
+    torch.testing.assert_close(loss, (-advantage * expected).mean())
+
+
+@pytest.mark.parametrize(
+    "linear,boost,w3,valid",
+    [
+        ("false", "0.2", "1", True),
+        ("false", "0.001", "0.95", True),
+        ("true", "0.2", "1", False),
+        ("false", "0", "1", False),
+        ("false", "nan", "1", False),
+        ("false", "0.2", "0", False),
+    ],
+)
+def test_quadratic_server_preflight(monkeypatch, capsys, linear, boost, w3, valid):
+    script = (Path(__file__).resolve().parents[4] / "run_steer_quadrant_quadratic_4096.sh").read_text()
+    source = script.split("<<'PY_CHECK_QUADRANT'\n", 1)[1].split("\nPY_CHECK_QUADRANT", 1)[0]
+    assert script.index("PY_CHECK_QUADRANT") < script.index("ray start --head")
+    monkeypatch.setattr(sys, "argv", ["-", "0.7", "1", linear, "quadrant_quadratic", boost, w3])
+    if valid:
+        exec(compile(source, "quadratic_server_preflight", "exec"), {})
+        assert "Quadratic STEER loaded from:" in capsys.readouterr().out
+    else:
+        with pytest.raises(ValueError, match="STEER"):
+            exec(compile(source, "quadratic_server_preflight", "exec"), {})

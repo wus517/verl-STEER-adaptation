@@ -88,7 +88,8 @@ policy_loss:
   # STEER mapping: false for exponential, true for linear.
   linear: true
 
-  # STEER mapping: symmetric, asymmetric, or quadrant (requires linear=false).
+  # STEER mapping: symmetric, asymmetric, quadrant, or quadrant_quadratic.
+  # Both quadrant modes require linear=false.
   entropy_control_mode: symmetric
 
   # Quadrant II/IV neutral interval is [0.5-half_width, 0.5+half_width].
@@ -96,6 +97,9 @@ policy_loss:
 
   # Quadrant II/IV boost and suppression amplitude around weight 1; in [0, 1).
   entropy_weight_strength: 0.10
+
+  # Quadratic II/IV maximum relative boost; finite and >= 0.001 (minimum boost).
+  entropy_boost_strength: 0.20
 
   # Quadrant III constant weight; finite and positive.
   quadrant_3_weight: 1.00
