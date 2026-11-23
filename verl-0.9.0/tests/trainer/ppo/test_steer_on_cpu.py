@@ -412,13 +412,16 @@ def test_actor_update_passes_old_entropy_and_horizon_metadata():
     assert tu.get_non_tensor_data(data, "calculate_entropy", default=None) is False
 
 
-def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
+@pytest.mark.parametrize("mode", ["symmetric", "quadrant_v3"])
+def test_engine_backward_keeps_old_local_token_mean(monkeypatch, mode):
+    from verl.trainer.ppo.steer_metrics import SteerV3Metrics
     from verl.workers.engine.fsdp import transformer_impl
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine
 
     # Real engine splitting and backward, with model/collectives replaced by CPU
     # fixtures. The 1-token and 3-token responses each receive half the update.
     engine = object.__new__(FSDPEngine)
+    engine.engine_config = SimpleNamespace(grad_sync_every_micro_batch=False)
     engine.ulysses_sequence_parallel_size = 1
     engine.scaler = None
     engine.get_data_parallel_group = lambda: None
@@ -426,7 +429,8 @@ def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
     engine._gradient_sync_context = lambda **_: nullcontext()
     monkeypatch.setattr(transformer_impl, "get_device_id", lambda: "cpu")
     monkeypatch.setattr(torch.distributed, "all_reduce", lambda *args, **kwargs: None)
-    config = _config(token_weight_min=1.0, token_weight_max=1.0)
+    config = _config(token_weight_min=1.0, token_weight_max=1.0, entropy_control_mode=mode, q2_boost_strength=0)
+    collector = SteerV3Metrics(q2_boost_strength=0) if mode == "quadrant_v3" else None
     parameters = torch.tensor([[-1.0, -1.0, -1.0], [-1.0, -1.0, -1.0]], requires_grad=True)
     data = TensorDict(
         {
@@ -455,12 +459,15 @@ def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
         index = batch["sample"].item()
         length = int(batch["response_mask"].sum())
         model_logp = torch.cat([parameters[index, :length], parameters.new_zeros(1)])
-        loss, metrics = ppo_loss(config, {"log_probs": model_logp}, batch)
+        loss, metrics = ppo_loss(config, {"log_probs": model_logp}, batch, steer_metrics=collector)
         return loss, {"loss": loss.detach(), "metrics": metrics}
 
     engine.forward_step = forward_step
     engine.forward_backward_batch(data, loss_function=ppo_loss)
     torch.testing.assert_close(parameters.grad, torch.tensor([[-0.5, 0, 0], [-1 / 6, -1 / 6, -1 / 6]]))
+    if collector is not None:
+        assert collector.totals[0] == 4
+        assert collector.flush()["steer/q2_active_count"] == 0
 
 
 @pytest.mark.parametrize("steer", [True, False])

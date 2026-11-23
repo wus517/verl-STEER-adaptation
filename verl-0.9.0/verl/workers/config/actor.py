@@ -95,7 +95,10 @@ class PolicyLossConfig(BaseConfig):
         token_weight_min (float): STEER lower bound; default matches the old actor fallback.
         token_weight_max (float): STEER upper bound; symmetric exponential always uses 1.
         linear (bool): Use the released linear mapping instead of exponential mapping.
-        entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
+        entropy_control_mode (str): STEER symmetric, asymmetric, or quadrant_v3 weighting.
+        q2_boost_strength (float): Maximum extra Q2 boost in quadrant_v3.
+        q2_boost_scale (float): Raw Q2 score at half the maximum extra boost.
+        steer_log_interval (int): Training steps per STEER statistics window.
     """
 
     loss_mode: str = "vanilla"
@@ -110,6 +113,9 @@ class PolicyLossConfig(BaseConfig):
     token_weight_max: float = 1.05
     linear: bool = True
     entropy_control_mode: str = "symmetric"
+    q2_boost_strength: float = 0.20
+    q2_boost_scale: float = 0.02
+    steer_log_interval: int = 1
 
     def __post_init__(self):
         if self.loss_mode != "entropy_control":
@@ -118,8 +124,14 @@ class PolicyLossConfig(BaseConfig):
             raise ValueError("STEER token_weight_min must be in (0, 1].")
         if not math.isfinite(self.token_weight_max) or self.token_weight_max < self.token_weight_min:
             raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
-        if self.entropy_control_mode not in ("symmetric", "asymmetric"):
-            raise ValueError("STEER entropy_control_mode must be symmetric or asymmetric.")
+        if self.entropy_control_mode not in ("symmetric", "asymmetric", "quadrant_v3"):
+            raise ValueError("STEER entropy_control_mode must be symmetric, asymmetric, or quadrant_v3.")
+        if not math.isfinite(self.q2_boost_strength) or self.q2_boost_strength < 0:
+            raise ValueError("STEER q2_boost_strength must be finite and nonnegative.")
+        if not math.isfinite(self.q2_boost_scale) or self.q2_boost_scale <= 0:
+            raise ValueError("STEER q2_boost_scale must be finite and positive.")
+        if type(self.steer_log_interval) is not int or self.steer_log_interval <= 0:
+            raise ValueError("STEER steer_log_interval must be a positive integer.")
 
 
 @dataclass

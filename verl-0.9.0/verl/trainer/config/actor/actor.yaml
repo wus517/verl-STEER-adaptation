@@ -88,8 +88,15 @@ policy_loss:
   # STEER mapping: false for exponential, true for linear.
   linear: true
 
-  # STEER controls the magnitude of entropy change by default.
+  # STEER weighting mode: symmetric, asymmetric, or quadrant_v3.
   entropy_control_mode: symmetric
+
+  # Quadrant V3 uses exponential attenuation for Q1/Q3 and a raw-score Q2 boost.
+  q2_boost_strength: 0.20
+  q2_boost_scale: 0.02
+
+  # Accumulate device-side STEER statistics across this many training steps.
+  steer_log_interval: 1
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

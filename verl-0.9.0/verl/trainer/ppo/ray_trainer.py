@@ -1345,10 +1345,16 @@ class RayPPOTrainer:
             seed=seed,
             dataloader_kwargs={"shuffle": shuffle},
             compute_loss=True,
+            steer_log_step=self.global_steps,
+            steer_log_flush=self.global_steps >= self.total_training_steps,
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
         actor_output = rename_dict(actor_output, "actor/")
+        actor_output = {
+            key.removeprefix("actor/") if key.startswith("actor/steer/") else key: value
+            for key, value in actor_output.items()
+        }
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})

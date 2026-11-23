@@ -639,6 +639,14 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 )
             else:
                 self.loss_fn = partial(ppo_loss, config=actor_config)
+                if (
+                    actor_config.policy_loss.loss_mode == "entropy_control"
+                    and actor_config.policy_loss.entropy_control_mode == "quadrant_v3"
+                ):
+                    from verl.trainer.ppo.steer_metrics import SteerV3Metrics
+
+                    self.steer_metrics = SteerV3Metrics(q2_boost_strength=actor_config.policy_loss.q2_boost_strength)
+                    self.loss_fn = partial(ppo_loss, config=actor_config, steer_metrics=self.steer_metrics)
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
@@ -707,6 +715,8 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @DistProfiler.annotate(color="red", role="actor_update")
     @_with_routing_replay_flag(enabled=True)
     def update_actor(self, data: TensorDict) -> TensorDict:
+        steer_log_step = tu.get_non_tensor_data(data, "steer_log_step", default=1)
+        steer_log_flush = tu.get_non_tensor_data(data, "steer_log_flush", default=False)
         if self.config.actor.policy_loss.loss_mode == "entropy_control":
             tu.assign_non_tensor(
                 data,
@@ -715,6 +725,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
                 calculate_entropy=False,
             )
         output = self.actor.train_mini_batch(data=data)
+        if getattr(self, "steer_metrics", None) is not None:
+            interval = self.config.actor.policy_loss.steer_log_interval
+            if steer_log_flush or steer_log_step % interval == 0:
+                metrics = self.steer_metrics.flush(dp_group=self.actor.engine.get_data_parallel_group())
+                if output is not None:
+                    tu.get(output, "metrics").update(metrics)
         return output.cpu() if output is not None else None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)

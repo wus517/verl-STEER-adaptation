@@ -1699,11 +1699,17 @@ class PPOTrainer(ABC):
             "seed": self.config.actor_rollout_ref.actor.data_loader_seed,
             "dataloader_kwargs": {"shuffle": self.config.actor_rollout_ref.actor.shuffle},
             "temperature": self.config.actor_rollout_ref.rollout.temperature,
+            "steer_log_step": self.global_steps,
+            "steer_log_flush": self.global_steps >= self.total_training_steps,
         }
         batch.extra_info.update(extra_info)
 
         output: TensorDict = self.actor_rollout_wg.update_actor(batch)
         output = rename_dict(output["metrics"], "actor/")
+        output = {
+            key.removeprefix("actor/") if key.startswith("actor/steer/") else key: value
+            for key, value in output.items()
+        }
         output["perf/mfu/actor"] = output.pop("actor/mfu")
         actor_metrics = reduce_metrics(output)
         metrics.update(actor_metrics)
