@@ -20,6 +20,7 @@ implement PPO-like algorithms.
 
 __all__ = ["register_adv_est", "get_adv_estimator_fn", "AdvantageEstimator"]
 
+import math
 from collections import defaultdict
 from enum import Enum
 from typing import Any, Callable, Optional
@@ -1502,6 +1503,23 @@ def compute_steer_v4_weights(
     return weights, quadrants, other_mask
 
 
+@torch.no_grad()
+def select_q2_high_entropy_tokens(entropys: torch.Tensor, q2: torch.Tensor, top_ratio: float) -> torch.Tensor:
+    """Select the highest-entropy Q2 positions across one local actor microbatch."""
+    if top_ratio == 0.0:
+        return torch.zeros_like(q2)
+
+    positions = q2.reshape(-1).nonzero(as_tuple=True)[0]
+    if positions.numel() == 0:
+        return torch.zeros_like(q2)
+
+    selected_count = math.ceil(positions.numel() * top_ratio)
+    ranks = entropys.reshape(-1)[positions].topk(selected_count, sorted=False).indices
+    release_mask = torch.zeros(q2.numel(), dtype=torch.bool, device=q2.device)
+    release_mask[positions[ranks]] = True
+    return release_mask.reshape(q2.shape)
+
+
 @register_policy_loss("entropy_control")
 def compute_policy_loss_with_entropy(
     old_log_prob: torch.Tensor,
@@ -1515,7 +1533,7 @@ def compute_policy_loss_with_entropy(
     entropys: torch.Tensor | None = None,
     steer_metrics=None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Released STEER loss with optional weight-preserving V4 quadrant statistics.
+    """STEER loss with optional quadrant statistics and high-entropy Q2 release.
 
     Aggregation is local, as in the old actor. The loss bridge applies the old
     gradient-accumulation scaling. Cached entropy is not current model entropy.
@@ -1525,8 +1543,10 @@ def compute_policy_loss_with_entropy(
     if rollout_is_weights is not None:
         raise ValueError("The old STEER loss does not use rollout IS weights.")
     policy = config.policy_loss
+    release_ratio = policy.get("q2_high_entropy_ratio", 0.0)
     quadrants = other_mask = None
-    if policy.steer_quadrant_logging:
+    release = None
+    if policy.steer_quadrant_logging or release_ratio > 0.0:
         weights, quadrants, other_mask = compute_steer_v4_weights(
             advantages,
             entropys,
@@ -1536,6 +1556,10 @@ def compute_policy_loss_with_entropy(
             token_weight_min=policy.token_weight_min,
             token_weight_max=policy.token_weight_max,
         )
+        if release_ratio > 0.0:
+            release_mask = select_q2_high_entropy_tokens(entropys, quadrants[1], release_ratio)
+            release = (release_mask, weights)
+            weights = weights.masked_fill(release_mask, 1.0)
     else:
         weights = compute_token_weights(
             advantages,
@@ -1559,7 +1583,7 @@ def compute_policy_loss_with_entropy(
     dual = torch.min(-advantages * config.clip_ratio_c, clipped)
     losses = torch.where(advantages < 0, dual, clipped)
     loss = agg_steer_loss(losses * weights, response_mask, loss_agg_mode)
-    if steer_metrics is not None and quadrants is not None:
+    if steer_metrics is not None and policy.steer_quadrant_logging:
         from verl.trainer.ppo.steer_metrics import compute_steer_v4_statistics
 
         steer_metrics.add(
@@ -1577,6 +1601,7 @@ def compute_policy_loss_with_entropy(
                 clip_low=clip_low,
                 clip_high=clip_high,
                 clip_ratio_c=config.clip_ratio_c,
+                q2_release=release,
             )
         )
     valid_weights = weights[response_mask > 0]

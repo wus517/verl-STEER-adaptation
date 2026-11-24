@@ -91,8 +91,11 @@ policy_loss:
   # STEER controls the magnitude of entropy change by default.
   entropy_control_mode: symmetric
 
-  # Add V4 quadrant metrics while preserving the original STEER weights and loss.
+  # Add STEER quadrant metrics to the existing training metrics.
   steer_quadrant_logging: false
+
+  # Restore unit weights for this fraction of the highest-entropy Q2 tokens. Zero disables V5 release.
+  q2_high_entropy_ratio: 0.0
 
 # Constant C in Dual-clip PPO; clips when advantage < 0 and ratio > C
 clip_ratio_c: 3.0

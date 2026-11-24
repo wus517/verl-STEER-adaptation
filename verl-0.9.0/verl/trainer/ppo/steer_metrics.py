@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
-"""Quadrant statistics for STEER V4."""
+"""Quadrant statistics for STEER and high-entropy Q2 release."""
 
 from functools import cache
 
@@ -48,6 +48,7 @@ def compute_steer_v4_statistics(
     clip_low,
     clip_high,
     clip_ratio_c,
+    q2_release: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Compute mask and weight sufficient statistics for one policy-loss call."""
     difference_grad = _clamp_gradient(log_prob_difference, -20.0, 20.0)
@@ -85,6 +86,10 @@ def compute_steer_v4_statistics(
         other_active.sum(),
         weights[valid].sum(dtype=torch.float64),
     ]
+    if q2_release is not None:
+        release_mask, base_weights = q2_release
+        active_release = release_mask & active
+        values.extend([release_mask.sum(), active_release.sum(), base_weights[active_release].sum(dtype=torch.float64)])
     return torch.stack([value.to(dtype=torch.float64) for value in values])
 
 
@@ -113,7 +118,7 @@ class SteerV4Metrics:
         quadrant_counts = values[2:6]
         quadrant_active_counts = values[6:10]
         quadrant_weight_sums = values[10:14]
-        other_count, other_active_count, weight_sum = values[14:]
+        other_count, other_active_count, weight_sum = values[14:17]
 
         metrics = {
             "steer/valid_count": valid_count,
@@ -133,6 +138,17 @@ class SteerV4Metrics:
             for index, count in enumerate(quadrant_active_counts, start=1):
                 metrics[f"steer/q{index}_active_frac"] = count / active_count
             metrics["steer/other_active_frac"] = other_active_count / active_count
+
+        if len(values) > 17:
+            release_count, active_release_count, active_base_weight_sum = values[17:]
+            q2_count = quadrant_counts[1]
+            q2_active_count = quadrant_active_counts[1]
+            if q2_count > 0:
+                metrics["steer/q2_release_frac"] = release_count / q2_count
+            if q2_active_count > 0:
+                metrics["steer/q2_release_active_frac"] = active_release_count / q2_active_count
+            if active_release_count > 0:
+                metrics["steer/q2_release_base_weight_mean"] = active_base_weight_sum / active_release_count
 
         self.totals.zero_()
         return metrics

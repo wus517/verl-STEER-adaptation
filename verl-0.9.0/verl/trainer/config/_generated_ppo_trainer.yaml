@@ -34,6 +34,7 @@ actor_rollout_ref:
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false
+      grad_sync_every_micro_batch: false
       model_dtype: fp32
       use_orig_params: false
       seed: 42
@@ -82,6 +83,12 @@ actor_rollout_ref:
       kl_cov_ratio: 0.0002
       ppo_kl_coef: 0.1
       dro_beta: null
+      token_weight_min: 0.95
+      token_weight_max: 1.05
+      linear: true
+      entropy_control_mode: symmetric
+      steer_quadrant_logging: false
+      q2_high_entropy_ratio: 0.0
     clip_ratio_c: 3.0
     loss_agg_mode: token-mean
     loss_scale_factor: null
@@ -227,6 +234,7 @@ actor_rollout_ref:
       reshard_after_forward: true
       fsdp_size: -1
       forward_prefetch: false
+      grad_sync_every_micro_batch: false
       model_dtype: fp32
       use_orig_params: false
       seed: 42
@@ -529,6 +537,7 @@ critic:
     reshard_after_forward: true
     fsdp_size: -1
     forward_prefetch: false
+    grad_sync_every_micro_batch: false
     model_dtype: fp32
     use_orig_params: false
     seed: 42
