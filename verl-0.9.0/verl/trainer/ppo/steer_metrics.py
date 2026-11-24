@@ -89,7 +89,14 @@ def compute_steer_v4_statistics(
     if q2_release is not None:
         release_mask, base_weights = q2_release
         active_release = release_mask & active
-        values.extend([release_mask.sum(), active_release.sum(), base_weights[active_release].sum(dtype=torch.float64)])
+        values.extend(
+            [
+                release_mask.sum(),
+                active_release.sum(),
+                base_weights[active_release].sum(dtype=torch.float64),
+                (weights[active_release] - 1.0).sum(dtype=torch.float64),
+            ]
+        )
     return torch.stack([value.to(dtype=torch.float64) for value in values])
 
 
@@ -140,7 +147,7 @@ class SteerV4Metrics:
             metrics["steer/other_active_frac"] = other_active_count / active_count
 
         if len(values) > 17:
-            release_count, active_release_count, active_base_weight_sum = values[17:]
+            release_count, active_release_count, active_base_weight_sum, active_boost_sum = values[17:]
             q2_count = quadrant_counts[1]
             q2_active_count = quadrant_active_counts[1]
             if q2_count > 0:
@@ -149,6 +156,7 @@ class SteerV4Metrics:
                 metrics["steer/q2_release_active_frac"] = active_release_count / q2_active_count
             if active_release_count > 0:
                 metrics["steer/q2_release_base_weight_mean"] = active_base_weight_sum / active_release_count
+                metrics["steer/q2_release_boost_mean"] = active_boost_sum / active_release_count
 
         self.totals.zero_()
         return metrics

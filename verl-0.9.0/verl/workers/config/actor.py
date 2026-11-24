@@ -98,6 +98,7 @@ class PolicyLossConfig(BaseConfig):
         entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
         steer_quadrant_logging (bool): Log STEER quadrant statistics.
         q2_high_entropy_ratio (float): Fraction of valid response tokens used to set the Q2 release cutoff.
+        q2_high_entropy_boost_strength (float): Maximum extra weight for selected Q2 tokens. Zero uses unit weights.
     """
 
     loss_mode: str = "vanilla"
@@ -114,6 +115,7 @@ class PolicyLossConfig(BaseConfig):
     entropy_control_mode: str = "symmetric"
     steer_quadrant_logging: bool = False
     q2_high_entropy_ratio: float = 0.0
+    q2_high_entropy_boost_strength: float = 0.0
 
     def __post_init__(self):
         if not isinstance(self.steer_quadrant_logging, bool):
@@ -121,6 +123,14 @@ class PolicyLossConfig(BaseConfig):
         ratio = self.q2_high_entropy_ratio
         if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or not 0.0 <= ratio <= 1.0:
             raise ValueError("STEER q2_high_entropy_ratio must be a finite number in [0, 1].")
+        strength = self.q2_high_entropy_boost_strength
+        if (
+            isinstance(strength, bool)
+            or not isinstance(strength, (int, float))
+            or not math.isfinite(strength)
+            or (strength != 0.0 and strength < 0.001)
+        ):
+            raise ValueError("STEER q2_high_entropy_boost_strength must be zero or a finite number >= 0.001.")
         if ratio > 0.0 and (
             self.loss_mode != "entropy_control" or self.entropy_control_mode != "symmetric" or self.linear
         ):

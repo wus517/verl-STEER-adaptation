@@ -1406,8 +1406,10 @@ def compute_token_weights(
     token_weight_max: float = 1.2,
     linear: bool = True,
     mode: str = "symmetric",
-) -> torch.Tensor:
-    """Released STEER proxy and mappings, preserving input-dtype math and fallback."""
+    *,
+    return_score_magnitude: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Compute STEER weights and optionally return score magnitudes before sanitization."""
     with torch.no_grad():
         x = torch.exp(log_prob)
         x = torch.clamp(x, min=1e-08, max=1.0 - 1e-08)
@@ -1421,6 +1423,7 @@ def compute_token_weights(
             metric = -advantage_over_old_prob * f_x
         else:
             metric = advantage_over_old_prob * f_x
+        score_magnitude = metric.abs() if return_score_magnitude else None
         if not torch.isfinite(metric).all():
             print("[Token Weighting] Warning: Found non-finite values in metric")
             metric = torch.where(torch.isfinite(metric), metric, torch.zeros_like(metric))
@@ -1428,7 +1431,8 @@ def compute_token_weights(
             metric = torch.abs(metric)
         valid_metric = metric[response_mask.bool()]
         if valid_metric.numel() == 0:
-            return torch.zeros_like(response_mask, dtype=torch.float)
+            weights = torch.zeros_like(response_mask, dtype=torch.float)
+            return (weights, score_magnitude) if score_magnitude is not None else weights
         metric_min = valid_metric.min()
         metric_max = valid_metric.max()
         token_weights = torch.zeros_like(metric, dtype=torch.float)
@@ -1460,7 +1464,7 @@ def compute_token_weights(
                 valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=1.0)
             token_weights[valid_mask] = valid_weights
         token_weights = token_weights * response_mask.float()
-        return token_weights
+        return (token_weights, score_magnitude) if score_magnitude is not None else token_weights
 
 
 @torch.no_grad()
@@ -1473,6 +1477,7 @@ def compute_steer_v4_weights(
     *,
     token_weight_min,
     token_weight_max,
+    return_score_magnitude=False,
 ):
     """Classify STEER tokens while returning the original helper's weights unchanged."""
     valid = response_mask.bool()
@@ -1499,7 +1504,11 @@ def compute_steer_v4_weights(
         token_weight_max=token_weight_max,
         linear=False,
         mode="symmetric",
+        return_score_magnitude=return_score_magnitude,
     )
+    if return_score_magnitude:
+        weights, score_magnitude = weights
+        return weights, quadrants, other_mask, score_magnitude
     return weights, quadrants, other_mask
 
 
@@ -1519,6 +1528,37 @@ def select_q2_high_entropy_tokens(
     top_count = math.ceil(valid_entropies.numel() * top_ratio)
     threshold = valid_entropies.topk(top_count, sorted=False).values.amin()
     return q2 & valid & (entropys >= threshold)
+
+
+@torch.no_grad()
+def apply_q2_high_entropy_boost(
+    steer_weights: torch.Tensor,
+    release_mask: torch.Tensor,
+    score_magnitude: torch.Tensor,
+    boost_strength: float,
+) -> torch.Tensor:
+    """Apply the square curve over finite scores in the selected Q2 set."""
+    if boost_strength == 0.0:
+        return steer_weights.masked_fill(release_mask, 1.0)
+    if steer_weights.numel() == 0:
+        return steer_weights
+
+    magnitude = score_magnitude.float()
+    eligible = release_mask & torch.isfinite(magnitude)
+    minimum = magnitude.masked_fill(~eligible, torch.inf).amin()
+    maximum = magnitude.masked_fill(~eligible, -torch.inf).amax()
+    has_scores = eligible.any()
+    minimum = torch.where(has_scores, minimum, 0.0)
+    maximum = torch.where(has_scores, maximum, 0.0)
+
+    span = maximum - minimum
+    safe_span = torch.where(span > 0, span, 1.0)
+    # The numerator is zero for a singleton or equal scores, giving maximum boost.
+    values = torch.where(eligible, magnitude, minimum)
+    normalized = ((values - minimum) / safe_span).clamp(0.0, 1.0)
+    boost = 0.001 + (boost_strength - 0.001) * (1.0 - normalized).square()
+    boosted_weights = 1.0 + torch.where(eligible, boost, 0.0)
+    return torch.where(release_mask, boosted_weights.to(steer_weights.dtype), steer_weights)
 
 
 @register_policy_loss("entropy_control")
@@ -1545,10 +1585,12 @@ def compute_policy_loss_with_entropy(
         raise ValueError("The old STEER loss does not use rollout IS weights.")
     policy = config.policy_loss
     release_ratio = policy.get("q2_high_entropy_ratio", 0.0)
+    boost_strength = policy.get("q2_high_entropy_boost_strength", 0.0)
+    use_boost = release_ratio > 0.0 and boost_strength > 0.0
     quadrants = other_mask = None
     release = None
     if policy.steer_quadrant_logging or release_ratio > 0.0:
-        weights, quadrants, other_mask = compute_steer_v4_weights(
+        weight_result = compute_steer_v4_weights(
             advantages,
             entropys,
             old_log_prob,
@@ -1556,11 +1598,16 @@ def compute_policy_loss_with_entropy(
             response_mask,
             token_weight_min=policy.token_weight_min,
             token_weight_max=policy.token_weight_max,
+            return_score_magnitude=use_boost,
         )
+        weights, quadrants, other_mask = weight_result[:3]
         if release_ratio > 0.0:
             release_mask = select_q2_high_entropy_tokens(entropys, quadrants[1], response_mask, release_ratio)
             release = (release_mask, weights)
-            weights = weights.masked_fill(release_mask, 1.0)
+            if use_boost:
+                weights = apply_q2_high_entropy_boost(weights, release_mask, weight_result[3], boost_strength)
+            else:
+                weights = weights.masked_fill(release_mask, 1.0)
     else:
         weights = compute_token_weights(
             advantages,
