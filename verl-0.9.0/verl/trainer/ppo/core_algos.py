@@ -1462,6 +1462,46 @@ def compute_token_weights(
         return token_weights
 
 
+@torch.no_grad()
+def compute_steer_v4_weights(
+    advantages,
+    entropys,
+    old_log_prob,
+    log_prob,
+    response_mask,
+    *,
+    token_weight_min,
+    token_weight_max,
+):
+    """Classify STEER tokens while returning the original helper's weights unchanged."""
+    valid = response_mask.bool()
+    probability = log_prob.exp().clamp(min=1e-8, max=1.0 - 1e-8)
+    boundary = probability.log() + entropys
+    classifiable = valid & torch.isfinite(advantages) & torch.isfinite(boundary)
+
+    high_probability = boundary > 0
+    low_probability = boundary < 0
+    q1 = classifiable & (advantages > 0) & high_probability
+    q2 = classifiable & (advantages > 0) & low_probability
+    q3 = classifiable & (advantages < 0) & low_probability
+    q4 = classifiable & (advantages < 0) & high_probability
+    quadrants = (q1, q2, q3, q4)
+    other_mask = valid & ~(q1 | q2 | q3 | q4)
+
+    weights = compute_token_weights(
+        advantages=advantages,
+        entropys=entropys,
+        old_log_prob=old_log_prob,
+        log_prob=log_prob,
+        response_mask=response_mask,
+        token_weight_min=token_weight_min,
+        token_weight_max=token_weight_max,
+        linear=False,
+        mode="symmetric",
+    )
+    return weights, quadrants, other_mask
+
+
 @register_policy_loss("entropy_control")
 def compute_policy_loss_with_entropy(
     old_log_prob: torch.Tensor,
@@ -1473,8 +1513,9 @@ def compute_policy_loss_with_entropy(
     rollout_is_weights: torch.Tensor | None = None,
     *,
     entropys: torch.Tensor | None = None,
+    steer_metrics=None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Released STEER loss under the 0.9.0 registry signature.
+    """Released STEER loss with optional weight-preserving V4 quadrant statistics.
 
     Aggregation is local, as in the old actor. The loss bridge applies the old
     gradient-accumulation scaling. Cached entropy is not current model entropy.
@@ -1484,17 +1525,29 @@ def compute_policy_loss_with_entropy(
     if rollout_is_weights is not None:
         raise ValueError("The old STEER loss does not use rollout IS weights.")
     policy = config.policy_loss
-    weights = compute_token_weights(
-        advantages,
-        entropys,
-        old_log_prob,
-        log_prob,
-        response_mask,
-        token_weight_min=policy.token_weight_min,
-        token_weight_max=policy.token_weight_max,
-        linear=policy.linear,
-        mode=policy.entropy_control_mode,
-    )
+    quadrants = other_mask = None
+    if policy.steer_quadrant_logging:
+        weights, quadrants, other_mask = compute_steer_v4_weights(
+            advantages,
+            entropys,
+            old_log_prob,
+            log_prob,
+            response_mask,
+            token_weight_min=policy.token_weight_min,
+            token_weight_max=policy.token_weight_max,
+        )
+    else:
+        weights = compute_token_weights(
+            advantages,
+            entropys,
+            old_log_prob,
+            log_prob,
+            response_mask,
+            token_weight_min=policy.token_weight_min,
+            token_weight_max=policy.token_weight_max,
+            linear=policy.linear,
+            mode=policy.entropy_control_mode,
+        )
     clip_low = config.clip_ratio_low if config.clip_ratio_low is not None else config.clip_ratio
     clip_high = config.clip_ratio_high if config.clip_ratio_high is not None else config.clip_ratio
     assert config.clip_ratio_c > 1.0
@@ -1506,6 +1559,26 @@ def compute_policy_loss_with_entropy(
     dual = torch.min(-advantages * config.clip_ratio_c, clipped)
     losses = torch.where(advantages < 0, dual, clipped)
     loss = agg_steer_loss(losses * weights, response_mask, loss_agg_mode)
+    if steer_metrics is not None and quadrants is not None:
+        from verl.trainer.ppo.steer_metrics import compute_steer_v4_statistics
+
+        steer_metrics.add(
+            compute_steer_v4_statistics(
+                advantages=advantages,
+                ratio=ratio,
+                log_prob_difference=log_prob - old_log_prob,
+                losses1=losses1,
+                losses2=losses2,
+                clipped=clipped,
+                response_mask=response_mask,
+                weights=weights,
+                quadrants=quadrants,
+                other_mask=other_mask,
+                clip_low=clip_low,
+                clip_high=clip_high,
+                clip_ratio_c=config.clip_ratio_c,
+            )
+        )
     valid_weights = weights[response_mask > 0]
     metrics = {
         "actor/pg_clipfrac": _steer_masked_mean((losses2 > losses1).float(), response_mask).item(),

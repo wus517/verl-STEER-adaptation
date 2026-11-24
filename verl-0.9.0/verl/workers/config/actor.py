@@ -96,6 +96,7 @@ class PolicyLossConfig(BaseConfig):
         token_weight_max (float): STEER upper bound; symmetric exponential always uses 1.
         linear (bool): Use the released linear mapping instead of exponential mapping.
         entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
+        steer_quadrant_logging (bool): Log V4 quadrants without changing STEER weights.
     """
 
     loss_mode: str = "vanilla"
@@ -110,9 +111,14 @@ class PolicyLossConfig(BaseConfig):
     token_weight_max: float = 1.05
     linear: bool = True
     entropy_control_mode: str = "symmetric"
+    steer_quadrant_logging: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.steer_quadrant_logging, bool):
+            raise ValueError("STEER steer_quadrant_logging must be a boolean.")
         if self.loss_mode != "entropy_control":
+            if self.steer_quadrant_logging:
+                raise ValueError("STEER quadrant logging requires loss_mode=entropy_control.")
             return
         if not math.isfinite(self.token_weight_min) or not 0 < self.token_weight_min <= 1:
             raise ValueError("STEER token_weight_min must be in (0, 1].")
@@ -120,6 +126,8 @@ class PolicyLossConfig(BaseConfig):
             raise ValueError("STEER token_weight_max must be finite and >= token_weight_min.")
         if self.entropy_control_mode not in ("symmetric", "asymmetric"):
             raise ValueError("STEER entropy_control_mode must be symmetric or asymmetric.")
+        if self.steer_quadrant_logging and (self.entropy_control_mode != "symmetric" or self.linear):
+            raise ValueError("STEER quadrant logging requires symmetric exponential weighting (linear=false).")
 
 
 @dataclass

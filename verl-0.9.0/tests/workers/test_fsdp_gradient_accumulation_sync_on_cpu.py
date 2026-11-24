@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -51,6 +52,7 @@ class _FSDP2Module:
 def _make_engine(module):
     engine = object.__new__(FSDPEngine)
     engine.module = module
+    engine.engine_config = SimpleNamespace(grad_sync_every_micro_batch=False)
     return engine
 
 

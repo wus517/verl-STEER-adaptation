@@ -402,6 +402,7 @@ def test_actor_update_passes_old_entropy_and_horizon_metadata():
     worker = SimpleNamespace(
         config=SimpleNamespace(actor=_config(), rollout=SimpleNamespace(response_length=17)),
         actor=SimpleNamespace(train_mini_batch=lambda data: captured.append(data)),
+        steer_metrics=None,
     )
     data = TensorDict({"sample": torch.arange(2)}, batch_size=[2])
     tu.assign_non_tensor(data, calculate_entropy=True)
@@ -419,6 +420,7 @@ def test_engine_backward_keeps_old_local_token_mean(monkeypatch):
     # Real engine splitting and backward, with model/collectives replaced by CPU
     # fixtures. The 1-token and 3-token responses each receive half the update.
     engine = object.__new__(FSDPEngine)
+    engine.engine_config = SimpleNamespace(grad_sync_every_micro_batch=False)
     engine.ulysses_sequence_parallel_size = 1
     engine.scaler = None
     engine.get_data_parallel_group = lambda: None

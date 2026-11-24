@@ -87,6 +87,9 @@ def validate_config(
     n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
     if config.actor_rollout_ref.actor.policy_loss.loss_mode == "entropy_control":
+        if config.actor_rollout_ref.actor.policy_loss.steer_quadrant_logging:
+            if not config.trainer.use_v1 or config.trainer.v1.trainer_mode != "sync":
+                raise ValueError("STEER quadrant logging currently supports the V1 sync trainer only.")
         if OmegaConf.select(config, "algorithm.rollout_correction.bypass_mode", default=False):
             raise ValueError("STEER requires cached old-policy entropy; rollout correction bypass_mode is unsupported.")
         if config.trainer.use_v1 and config.trainer.v1.trainer_mode != "sync":
