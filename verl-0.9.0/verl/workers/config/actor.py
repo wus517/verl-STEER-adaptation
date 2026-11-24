@@ -97,7 +97,7 @@ class PolicyLossConfig(BaseConfig):
         linear (bool): Use the released linear mapping instead of exponential mapping.
         entropy_control_mode (str): STEER symmetric magnitude or asymmetric signed proxy.
         steer_quadrant_logging (bool): Log STEER quadrant statistics.
-        q2_high_entropy_ratio (float): Fraction of Q2 tokens whose STEER weights are restored to one.
+        q2_high_entropy_ratio (float): Fraction of valid response tokens used to set the Q2 release cutoff.
     """
 
     loss_mode: str = "vanilla"

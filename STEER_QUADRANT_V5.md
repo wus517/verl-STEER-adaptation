@@ -2,14 +2,14 @@
 
 ## 1. 实验设计
 
-V5 以 V4 的对称指数版 STEER 为对照。在每次 actor 策略损失计算中，先沿用 V4 对有效回答 token 划分象限，并为整个本地 microbatch 计算原始 STEER 权重。然后在Ⅱ象限内部按条件熵取前 20%，把选中位置的权重设为 `1.0`。其余位置沿用原始 STEER 权重。
+V5 以 V4 的对称指数版 STEER 为对照。在每次 actor 策略损失计算中，先沿用 V4 对有效回答 token 划分象限，并为整个本地 microbatch 计算原始 STEER 权重。随后用当前 microbatch 全部有效回答 token 的条件熵确定前 20% 的分界值，将Ⅱ象限中达到这个分界值的位置设为 `1.0`。其余位置沿用原始 STEER 权重。
 
 这里的放行是指保留该 token 在原 PPO 裁剪后的策略更新力度。对照运行使用 V4，使两组共用同一套象限划分、STEER 权重计算和日志统计。实验比较的是在Ⅱ象限中优先放行高熵位置之后的训练效果。
 
 | 位置 | V5 最终权重 |
 |---|---|
 | Ⅰ、Ⅲ、Ⅳ象限 | 原始 STEER 权重 |
-| Ⅱ象限，入选该 microbatch 内Ⅱ象限的熵排名前 20% | `1.0` |
+| Ⅱ象限，条件熵达到本地 microbatch 全体有效回答 token 的前 20% 分界值 | `1.0` |
 | Ⅱ象限，其余位置 | 原始 STEER 权重 |
 | 零优势、概率分界及 V4 的其他未分类有效位置 | 原始 STEER 权重 |
 | Padding | 原始 STEER 返回的 `0` |
@@ -33,9 +33,9 @@ V5 以 V4 的对称指数版 STEER 为对照。在每次 actor 策略损失计�
 | Ⅲ | $A<0$ | $b<0$ |
 | Ⅳ | $A<0$ | $b>0$ |
 
-有效性、有限性检查和边界位置处理均沿用 V4。两个判断读取同一份 `entropys`。第一层结合当前概率和优势判断象限，第二层在Ⅱ象限内直接比较各位置的条件熵。
+有效性、有限性检查和边界位置处理均沿用 V4。象限划分与阈值计算读取同一份 `entropys`。象限划分结合当前概率和优势，放行判断比较Ⅱ象限各位置的条件熵与全体有效回答 token 的熵阈值。
 
-筛选发生在当前本地 microbatch 进入 actor 损失计算时。使用已经与回答位置对齐的熵缓存和本次前向计算得到的 `log_prob`。每卡 `microbatch=1` 时，比较范围是本卡这一条回答的Ⅱ象限 token；各数据并行卡独立筛选。
+筛选发生在当前本地 microbatch 进入 actor 损失计算时。使用已经与回答位置对齐的熵缓存和本次前向计算得到的 `log_prob`。每卡 `microbatch=1` 时，本卡用这一条回答的有效 token 计算熵阈值，各数据并行卡独立计算。
 
 ## 3. 原始权重与Ⅱ象限筛选
 
@@ -67,32 +67,23 @@ $$
 
 实际权重以原始 `compute_token_weights` 返回值为准，复用其对称指数路径的运算顺序和浮点截断。**先以完整 `response_mask` 算原权重，再覆盖入选位置。** Ⅱ象限入选和未入选的位置都参与原分母计算，和其他象限共用同一个分母。放行操作完成后直接使用最终权重。
 
-### 3.2 在Ⅱ象限内部选 top 20%
+### 3.2 用全部有效回答 token 定阈值
 
-1. 取本次调用中 `q2` 为真的位置。候选集合包含Ⅱ象限全部有效 token，PPO 裁剪前完成筛选。
-2. 从 `entropys` 读取这些位置的条件熵。候选为空时，本次使用整份原权重。
-3. 取候选数乘 `q2_high_entropy_ratio` 后向上取整，默认比例为 `0.20`。用 `torch.topk` 按熵选出这个数量的位置。
-4. 把选中位置映射回原张量，生成 `q2_release_mask`，将这些位置的权重设为 `1.0`。
+1. 用 `response_mask` 取当前 microbatch 内条件熵有限的有效回答 token。四个象限、零优势和概率分界上的有效位置都可以参与计算阈值。Padding 与非有限熵位置排除。
+2. 将有效熵的数量乘 `q2_high_entropy_ratio`（V5 训练取 `0.20`），再向上取整。用 `torch.topk` 取得最高的这部分熵值，其中的最小值就是本次熵阈值。
+3. 用 `q2` 与“条件熵大于或等于阈值”的掩码取交集，得到 `q2_release_mask`，将这些位置的权重设为 `1.0`。
 
-本次选中项的最低熵可以看作该 microbatch 的熵分界。直接使用 top-k 返回的位置处理边界同熵项，选中数按上述取整规则计算。每次调用都从当前候选计算该分界，使用当前训练的数据即可。比例为 `0` 时关闭放行。
+阈值在 PPO 裁剪前计算。有效熵为空、Ⅱ象限为空，或Ⅱ象限全部低于阈值时，放行掩码全为假。比例为 `0` 时关闭放行。阈值相同的Ⅱ象限位置都按同一规则放行，边界有并列时达到阈值的位置可以超过全体的 20%。
 
-| 当前 microbatch 的Ⅱ象限候选数 | 比例参数 | 实际放行数量 |
-|---:|---:|---:|
-| 0 | `0.20` | 0 |
-| 1 | `0.20` | 1 |
-| 4 | `0.20` | 1 |
-| 5 | `0.20` | 1 |
-| 11 | `0.20` | 3 |
+例如，一条回答有 10 个有效 token，最高的两个熵为 `2.0` 和 `1.6`，本次阈值就是 `1.6`。如果两个Ⅱ象限 token 的熵分别为 `1.2` 和 `1.6`，只放行后一个。此时Ⅱ象限的实际放行比例为 50%。如果这两个位置的熵都低于 `1.6`，本次Ⅱ象限的放行比例为 0%。
 
-例如，某条回答有 5 个Ⅱ象限候选，按位置顺序的条件熵为 `[0.30, 1.20, 0.85, 1.75, 0.55]`，则放行第 4 个候选。即使Ⅰ象限有熵为 `2.40` 的 token，它也照常使用 STEER 权重。
-
-动态 top-k 的选取方式参考 *Beyond the 80/20 Rule* 第 5.1 节和作者实现。论文的训练代码从本地 microbatch 的所有有效回答 token 中挑选高熵位置，并用选中掩码汇总策略损失。V5 将候选集合限定为Ⅱ象限，选中后覆盖权重，损失仍用原 `response_mask` 汇总。[论文](</Users/lhx/VSCodeFiles/RL_discuss/paper_reading/Beyond the 80:20 Rule.pdf>) · [作者 top-k 实现](https://github.com/Shenzhi-Wang/Beyond-the-80-20-Rule-RLVR/blob/6f5dda6f70dbee207bea28705e5f96ce12eb98df/verl/trainer/ppo/core_algos.py#L53-L87) · [作者 actor 调用位置](https://github.com/Shenzhi-Wang/Beyond-the-80-20-Rule-RLVR/blob/6f5dda6f70dbee207bea28705e5f96ce12eb98df/verl/workers/actor/dp_actor.py#L459-L488)
+动态阈值参考 *Beyond the 80/20 Rule* 第 5.1 节。V5 沿用作者代码的本地 microbatch 统计范围，用排名分界值筛选Ⅱ象限。损失继续使用原 `response_mask` 汇总。[论文](</Users/lhx/VSCodeFiles/RL_discuss/paper_reading/Beyond the 80:20 Rule.pdf>) · [作者 top-k 实现](https://github.com/Shenzhi-Wang/Beyond-the-80-20-Rule-RLVR/blob/6f5dda6f70dbee207bea28705e5f96ce12eb98df/verl/trainer/ppo/core_algos.py#L53-L87)
 
 ## 4. 代码接入
 
 ### 4.1 配置
 
-在 `PolicyLossConfig` 和对应 Hydra 配置增加 `q2_high_entropy_ratio`，代码默认值为 `0.0`。V5 启动配置显式设为 `0.20`。检查取值为有限数且在闭区间 `[0, 1]` 内。启用放行时使用 `loss_mode: entropy_control`、`entropy_control_mode: symmetric` 和 `linear: false`。放行由比例参数控制，`steer_quadrant_logging` 控制日志，V4 和 V5 实验配置均开启日志。
+沿用 `PolicyLossConfig` 和 Hydra 中的 `q2_high_entropy_ratio` 配置名。它表示计算Ⅱ象限放行阈值时采用的全体有效回答 token 比例，代码默认值为 `0.0`，V5 启动配置显式设为 `0.20`。检查取值为有限数且在闭区间 `[0, 1]` 内。启用放行时使用 `loss_mode: entropy_control`、`entropy_control_mode: symmetric` 和 `linear: false`。放行由比例参数控制，`steer_quadrant_logging` 控制日志，V4 和 V5 实验配置均开启日志。
 
 ```yaml
 actor_rollout_ref:
@@ -114,33 +105,28 @@ import torch
 
 
 @torch.no_grad()
-def select_q2_high_entropy_tokens(entropys, q2, top_ratio):
+def select_q2_high_entropy_tokens(entropys, q2, response_mask, top_ratio):
     if top_ratio == 0.0:
         return torch.zeros_like(q2)
 
-    candidate_positions = q2.reshape(-1).nonzero(as_tuple=True)[0]
-    candidate_count = candidate_positions.numel()
-    if candidate_count == 0:
+    valid = response_mask.bool() & torch.isfinite(entropys)
+    valid_entropies = entropys[valid]
+    if valid_entropies.numel() == 0:
         return torch.zeros_like(q2)
 
-    candidate_entropies = entropys.reshape(-1)[candidate_positions]
-    selected_count = math.ceil(candidate_count * top_ratio)
-    selected_ranks = candidate_entropies.topk(selected_count, sorted=False).indices
-    selected_positions = candidate_positions[selected_ranks]
-
-    flat_release = torch.zeros(q2.numel(), dtype=torch.bool, device=q2.device)
-    flat_release[selected_positions] = True
-    return flat_release.reshape(q2.shape)
+    top_count = math.ceil(valid_entropies.numel() * top_ratio)
+    threshold = valid_entropies.topk(top_count, sorted=False).values.amin()
+    return q2 & valid & (entropys >= threshold)
 ```
 
-`q2` 是 V4 返回的Ⅱ象限布尔掩码，`top_ratio` 是已经过配置校验的比例，返回值与 `q2` 同形状。`selected_ranks` 是 top-k 返回的候选列表索引，`selected_positions` 是它们对应的原张量扁平位置。
+`q2` 是 V4 返回的Ⅱ象限布尔掩码，`top_ratio` 是已经过配置校验的比例。筛选直接用布尔掩码完成，返回值与 `q2` 同形状。
 
 在 `compute_policy_loss_with_entropy` 中，满足“已开启象限日志或放行比例大于零”时，调用 `compute_steer_v4_weights` 获取完整的基线权重 `steer_weights`、`quadrants` 和 `other_mask`。其余调用走原 STEER 路径。在已取得象限掩码的路径按以下方式生成最终权重。
 
 ```python
 q2 = quadrants[1]
 q2_release_mask = select_q2_high_entropy_tokens(
-    entropys, q2, policy.q2_high_entropy_ratio
+    entropys, q2, response_mask, policy.q2_high_entropy_ratio
 )
 weights = (
     steer_weights.masked_fill(q2_release_mask, 1.0)
@@ -161,12 +147,12 @@ weights = (
 | `steer/q2_release_active_frac` | 入选且活跃的Ⅱ象限 token 数除以全部Ⅱ象限活跃 token 数。观察当前有策略梯度的位置中有多少被放行 |
 | `steer/q2_release_base_weight_mean` | 入选且活跃的Ⅱ象限 token 的原 STEER 权重之和，除以入选且活跃的Ⅱ象限 token 数。该均值距离 `1.0` 越远，恢复的权重越多 |
 
-活跃指原 PPO 策略项对当前采样 token 的对数概率有有限且非零的导数，沿用 V4 的裁剪判定。筛选使用全部Ⅱ象限有效位置，活跃统计仅用于日志。复用 V4 的设备端累加与日志步数据并行汇总，将新增分子和分母随原统计一起归约，再计算全局比例与均值。分母为零时跳过对应指标。
+活跃指原 PPO 策略项对当前采样 token 的对数概率有有限且非零的导数，沿用 V4 的裁剪判定。阈值用全体有效回答 token 的有限熵计算，放行比例继续以Ⅱ象限的计数为分母。复用 V4 的设备端累加与日志步数据并行汇总，将新增分子和分母随原统计一起归约，再计算全局比例与均值。分母为零时跳过对应指标。
 
 ## 6. 对照与验收
 
 - **对照配置**。V4 取 `q2_high_entropy_ratio: 0.0`，V5 取 `q2_high_entropy_ratio: 0.20`。两组使用相同起始模型、训练数据和随机种子、rollout 参数、优势计算、actor batch 与优化器配置。分别记录实验名和 TensorBoard 目录。
 - **权重一致性**。对固定输入核对 V5 覆盖前的权重与 V4 逐项相同。最终权重在入选位置为 `1.0`，其余位置与 V4 逐项相同。加入一个入选Ⅱ象限位置恰好提供最大绝对 STEER 分数的用例，核对其他位置的权重。
-- **筛选边界**。覆盖无Ⅱ象限候选、单个候选、整数与非整数取整、边界同熵、padding、零优势、其他象限有更高熵等情况。核对比例设为 `0.0` 时权重、策略损失和对数概率梯度与 V4 逐项一致。
+- **筛选边界**。覆盖有效熵为空、Ⅱ象限为空、Ⅱ象限全部低于阈值、全体计数向上取整、阈值并列、高熵 padding 与非有限熵排除，以及其他象限或零优势位置提高阈值的情况。核对比例设为 `0.0` 时权重、策略损失和对数概率梯度与 V4 逐项一致。
 - **梯度校验**。固定同一批输入，对比逐 token 策略梯度。入选且活跃的位置与单位权重下的 PPO 策略梯度一致，已裁剪为零梯度的入选位置仍为零。其余位置的逐 token 策略梯度保持 V4 的数值。
 - **日志验收**。读取训练 event 文件，核对原有指标、V4 四象限指标和 V5 新增指标共同写入。用候选数量不同的 microbatch 核对汇总结果，确认比例使用汇总后的计数。

@@ -5,7 +5,7 @@
 当前分支 `steer_quadrant_v5` 从 V4 的 `d384415` 创建。以 `STEER_QUADRANT_V5.md` 为规格，从 `run_steer_datav8.sh` 派生 `run_steer_quadrant_v5_datav8.sh`。
 
 - `q2_high_entropy_ratio` 默认 `0.0`，V5 脚本设为 `0.20`。放行可独立于 `steer_quadrant_logging` 启用。
-- 在同一 actor microbatch 内先用完整 `response_mask` 计算原权重，再用缓存的旧策略熵在Ⅱ象限做 `ceil(n × ratio)` 的 `torch.topk`，将入选权重改为 `1.0`。
+- 在同一 actor microbatch 内先用完整 `response_mask` 计算原权重。用全部有效回答 token 的有限熵确定前 20% 的分界值，再将达到该值的Ⅱ象限位置权重改为 `1.0`。阈值并列的Ⅱ象限位置均放行。
 - 策略损失继续使用现有裁剪、dual-clip、原回答掩码及损失聚合。用 V4 活跃判定生成三项新增日志，V4 权重指标读取实际乘入 loss 的权重。每次日志刷新沿用一次 DP SUM。
 - V4 对照用比例 `0.0`，保留 V4 日志集合。放行比例大于零且开启日志时，追加分母非零的 V5 指标。两种配置均保留原 TensorBoard 指标。
 

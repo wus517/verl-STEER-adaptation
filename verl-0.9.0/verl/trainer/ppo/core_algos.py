@@ -1504,20 +1504,21 @@ def compute_steer_v4_weights(
 
 
 @torch.no_grad()
-def select_q2_high_entropy_tokens(entropys: torch.Tensor, q2: torch.Tensor, top_ratio: float) -> torch.Tensor:
-    """Select the highest-entropy Q2 positions across one local actor microbatch."""
+def select_q2_high_entropy_tokens(
+    entropys: torch.Tensor, q2: torch.Tensor, response_mask: torch.Tensor, top_ratio: float
+) -> torch.Tensor:
+    """Select Q2 positions at or above the microbatch-wide response entropy cutoff."""
     if top_ratio == 0.0:
         return torch.zeros_like(q2)
 
-    positions = q2.reshape(-1).nonzero(as_tuple=True)[0]
-    if positions.numel() == 0:
+    valid = response_mask.bool() & torch.isfinite(entropys)
+    valid_entropies = entropys[valid]
+    if valid_entropies.numel() == 0:
         return torch.zeros_like(q2)
 
-    selected_count = math.ceil(positions.numel() * top_ratio)
-    ranks = entropys.reshape(-1)[positions].topk(selected_count, sorted=False).indices
-    release_mask = torch.zeros(q2.numel(), dtype=torch.bool, device=q2.device)
-    release_mask[positions[ranks]] = True
-    return release_mask.reshape(q2.shape)
+    top_count = math.ceil(valid_entropies.numel() * top_ratio)
+    threshold = valid_entropies.topk(top_count, sorted=False).values.amin()
+    return q2 & valid & (entropys >= threshold)
 
 
 @register_policy_loss("entropy_control")
@@ -1557,7 +1558,7 @@ def compute_policy_loss_with_entropy(
             token_weight_max=policy.token_weight_max,
         )
         if release_ratio > 0.0:
-            release_mask = select_q2_high_entropy_tokens(entropys, quadrants[1], release_ratio)
+            release_mask = select_q2_high_entropy_tokens(entropys, quadrants[1], response_mask, release_ratio)
             release = (release_mask, weights)
             weights = weights.masked_fill(release_mask, 1.0)
     else:

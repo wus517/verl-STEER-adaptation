@@ -45,14 +45,14 @@ def actor_config(ratio, *, logging=True, weight_min=0.7):
 
 
 def batch():
-    # The two highest-entropy Q2 positions are 0 (active, also the maximum
-    # absolute score) and 1 (clipped). Positions 6-10 cover other quadrants,
-    # zero advantage and padding, including entropies above both selections.
+    # The two highest-entropy valid positions are 0 (active, also the maximum
+    # absolute score) and 1 (clipped), both in Q2. Positions 6-10 cover other
+    # quadrants, zero advantage and a padding token with the highest entropy.
     log_prob = torch.tensor([[-4.0, -4.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0, -2.0]])
     old = log_prob.clone()
     old[0, 1] -= 0.5
     advantages = torch.tensor([[25.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 0.0, 9.0]])
-    entropy = torch.tensor([[3.5, 3.0, 0.1, 0.2, 0.3, 0.4, 8.0, 0.4, 4.0, 9.0, 10.0]])
+    entropy = torch.tensor([[3.5, 3.0, 0.1, 0.2, 0.3, 0.4, 2.3, 0.4, 2.5, 2.8, 10.0]])
     mask = torch.tensor([[1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]], dtype=torch.bool)
     return old, log_prob, advantages, entropy, mask
 
@@ -65,18 +65,26 @@ def policy_loss(data, config, collector=None):
 
 
 @pytest.mark.parametrize(
-    ("candidates", "ratio", "selected"),
-    [(0, 0.2, 0), (1, 0.2, 1), (4, 0.2, 1), (5, 0.2, 1), (11, 0.2, 3), (11, 0, 0), (11, 1, 11)],
+    ("valid_positions", "ratio", "selected_positions"),
+    [
+        (0, 0.2, []),
+        (1, 0.2, [0]),
+        (5, 0.2, []),
+        (6, 0.2, [0, 2]),
+        (6, 0.0, []),
+        (6, 1.0, [0, 2, 3]),
+    ],
 )
-def test_topk_count_and_ties(candidates, ratio, selected):
-    q2 = (torch.arange(12) < candidates).reshape(3, 4).t()
-    entropy = torch.full_like(q2, 2.0, dtype=torch.float32)
-    entropy[~q2] = 100.0
-    release = select_q2_high_entropy_tokens(entropy, q2, ratio)
+def test_microbatch_entropy_cutoff_with_ties_and_padding(valid_positions, ratio, selected_positions):
+    entropy = torch.tensor([2.0, 3.0, 2.0, 1.0, 0.5, 0.1, 100.0, float("nan")]).reshape(2, 4).t()
+    q2 = torch.tensor([True, False, True, True, False, False, False, False]).reshape(2, 4).t()
+    mask = ((torch.arange(8) < valid_positions) | (torch.arange(8) == 7)).reshape(2, 4).t()
+    q2 = q2 & mask
+    release = select_q2_high_entropy_tokens(entropy, q2, mask, ratio)
     assert release.shape == q2.shape
     assert release.dtype == torch.bool
-    assert release.sum() == selected
-    assert not (release & ~q2).any()
+    assert release.t().flatten().nonzero(as_tuple=True)[0].tolist() == selected_positions
+    assert not select_q2_high_entropy_tokens(entropy, torch.zeros_like(q2), mask, ratio).any()
 
 
 @pytest.mark.parametrize("ratio", [-0.1, 1.1, float("nan"), float("inf"), True, "0.2"])
@@ -98,7 +106,7 @@ def test_release_preserves_base_denominator_and_token_gradients():
     old, log_prob, advantages, entropy, mask = batch()
     weight_options = {"token_weight_min": 0.7, "token_weight_max": 1.0}
     base_weights, quadrants, _ = compute_steer_v4_weights(advantages, entropy, old, log_prob, mask, **weight_options)
-    release = select_q2_high_entropy_tokens(entropy, quadrants[1], 0.2)
+    release = select_q2_high_entropy_tokens(entropy, quadrants[1], mask, 0.2)
     assert release.nonzero(as_tuple=False).tolist() == [[0, 0], [0, 1]]
     assert base_weights[0, 0].item() == pytest.approx(0.7)
     excluded_weights, _, _ = compute_steer_v4_weights(
@@ -162,7 +170,7 @@ def _check_window(metrics):
     base, quadrants, _ = compute_steer_v4_weights(
         advantages, entropy, old, log_prob, mask, token_weight_min=0.7, token_weight_max=1.0
     )
-    effective = base.masked_fill(select_q2_high_entropy_tokens(entropy, quadrants[1], 0.2), 1)
+    effective = base.masked_fill(select_q2_high_entropy_tokens(entropy, quadrants[1], mask, 0.2), 1)
     assert metrics["steer/q2_weight_mean"] == pytest.approx((effective[quadrants[1]].sum().item() + 1) / 7)
     assert metrics["steer/weight_mean"] == pytest.approx((effective.sum().item() + 1) / 11)
 
