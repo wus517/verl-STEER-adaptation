@@ -170,11 +170,7 @@ class Tracking:
             self.logger["vemlp_wandb"] = vemlp_wandb
 
         if "tensorboard" in default_backend:
-            policy = (config or {}).get("actor_rollout_ref", {}).get("actor", {}).get("policy_loss", {})
-            steer_only = (
-                policy.get("loss_mode") == "entropy_control" and policy.get("entropy_control_mode") == "quadrant_v3"
-            )
-            self.logger["tensorboard"] = _TensorboardAdapter(project_name, experiment_name, steer_only=steer_only)
+            self.logger["tensorboard"] = _TensorboardAdapter(project_name, experiment_name)
 
         if "console" in default_backend:
             from verl.utils.logger import LocalLogger
@@ -443,7 +439,7 @@ class FileLogger:
 
 
 class _TensorboardAdapter:
-    def __init__(self, project_name, experiment_name, *, steer_only=False):
+    def __init__(self, project_name, experiment_name):
         import os
 
         from torch.utils.tensorboard import SummaryWriter
@@ -452,12 +448,10 @@ class _TensorboardAdapter:
         os.makedirs(tensorboard_dir, exist_ok=True)
         print(f"Saving tensorboard log to {tensorboard_dir}.")
         self.writer = SummaryWriter(tensorboard_dir)
-        self.steer_only = steer_only
 
     def log(self, data, step):
         for key in data:
-            if not self.steer_only or key.startswith("steer/"):
-                self.writer.add_scalar(key, data[key], step)
+            self.writer.add_scalar(key, data[key], step)
 
     def finish(self):
         self.writer.close()

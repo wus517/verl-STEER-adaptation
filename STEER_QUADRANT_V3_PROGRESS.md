@@ -12,7 +12,7 @@
 - PPO 裁剪后的逐 token loss 乘 detached 权重，采用已有 STEER 局部 loss 聚合与梯度累积。
 - 活跃判定按现有 maximum/minimum/clamp 的真实导数，覆盖 dual-clip、数值截断及相等边界。effective boost 包含局部 loss 聚合和梯度累积系数。
 - 设备端累计日志窗口的计数与加权和，日志步一次 DP SUM 后批量转 CPU。默认每训练步记录，支持配置间隔及末步刷新。
-- V3 的 TensorBoard 写入 `steer/*` 标量，控制台仍可查看训练状态。
+- V3 将 `steer/*` 标量加入 TensorBoard，原有训练标量继续写入。
 - 适配现有同步 FSDP/FSDP2 的 V1 与 V0 缓存格式。
 
 ## 实现与核对清单
@@ -21,7 +21,7 @@
 - [x] 权重 helper 与 actor 策略损失。
 - [x] 精确活跃判定与含聚合系数的统计，已完成自动求导对照。
 - [x] worker 日志累加、DP SUM、日志窗口刷新、trainer 标签传递。
-- [x] TensorBoard STEER 指标筛选。
+- [x] TensorBoard 保留原指标并加入 STEER 指标。
 - [x] 原代码Ⅰ/Ⅲ对照、Ⅱ算例、分界与 padding、裁剪边界梯度测试。
 - [x] 变长 microbatch、模拟 DP 汇总、缓存熵接口、旧适配回归。
 - [x] 新 4096 启动脚本、语法及参数检查。
@@ -29,7 +29,7 @@
 
 ## 当前进度
 
-2026-11-23 已实现配置、数学核心、设备累加器、worker 与 V0/V1 trainer 接入、TensorBoard 筛选，并交付 `run_steer_quadrant_v3_4096.sh`。
+2026-11-23 已实现配置、数学核心、设备累加器、worker 与 V0/V1 trainer 接入、TensorBoard 指标追加，并交付 `run_steer_quadrant_v3_4096.sh`。
 
 CPU 环境由 uv 在 `/tmp/steer-v3-venv` 创建，Python 3.12.14，以 `.pth` 加载本机只读缓存依赖。缓存的 pydantic/core 版本冲突已通过选取匹配版本解决。PyTorch 为 2.14.1，TensorDict 为 0.10.0。
 
@@ -37,7 +37,7 @@ CPU 环境由 uv 在 `/tmp/steer-v3-venv` 创建，Python 3.12.14，以 `.pth` �
 
 旧 STEER 及 FSDP 同步测试的 FSDPEngine 替身缺少后续引入的 `engine_config.grad_sync_every_micro_batch` 字段，已补齐测试替身。第一轮测试暴露的新测试配置冻结字段写入和 Hydra 必需参数问题已修正。
 
-首轮完整验证为 138 项通过，含 42 项 V3、56 项旧 STEER、40 项原算法与配置回归。TensorBoard 测试实际读回 event 文件，确认 V3 的标量标签仅为 `steer/*`。DP 窗口测试覆盖分子分母求和和单次 SUM 调用，真实跨进程归约待检查。
+首轮完整验证为 138 项通过，含 42 项 V3、56 项旧 STEER、40 项原算法与配置回归。TensorBoard 测试实际读回 event 文件。原先 V3 专属的标签过滤已移除，当前回归断言同时读回 `steer/q2_active_count`、`actor/pg_loss` 和 `val/accuracy`。DP 窗口测试覆盖分子分母求和和单次 SUM 调用，真实跨进程归约待检查。
 
 ## 最终验证
 
@@ -66,7 +66,7 @@ python -m pytest -q \
 - V0 padded/V1 nested 缓存熵，经真实 `ppo_loss`、静态/动态累积和变长 microbatch 的 effective boost 与实际累积梯度对照。
 - 原 FSDP 引擎的 microbatch 拆分及 backward 循环对 V3 执行验证，模型前向和 collective 使用 CPU 替身。
 - 日志算例拆到不同 microbatch 和模拟 DP rank，计数、助推、梯度加权和、裁剪、半助推占比一致。窗口间隔、末步刷新、分母为零跳过、gamma 为零跳过半助推比例均通过。
-- V0/V1 trainer 方法实际执行，检查日志步元数据和顶层 `steer/*` 标签。TensorBoard event 文件读回校验标签。
+- V0/V1 trainer 方法实际执行，检查日志步元数据和顶层 `steer/*` 标签。TensorBoard event 文件读回校验原有 `actor/*`、`val/*` 与新增 `steer/*` 标签同时写入。
 - 修改的 11 个 Python 文件通过 Ruff lint 和格式检查，`git diff --check` 通过。
 
 新脚本通过 `bash -n`。用隔离的命令捕获器展开脚本变量后，将全部 **98 个训练参数** 交给真实 Hydra compose、Actor dataclass 和 `validate_config` 检查，结果通过。已核对 response horizon 为 4096、microbatch 为 1、模式为 quadrant_v3、下限为 0.7、助推参数为 0.20/0.02。脚本中的 V3 源码加载检查也单独执行通过。

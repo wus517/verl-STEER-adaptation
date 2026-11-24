@@ -450,8 +450,7 @@ def test_hydra_v3_configuration():
     assert policy.steer_log_interval == 3
 
 
-@pytest.mark.parametrize("mode", ["quadrant_v3", "symmetric"])
-def test_tensorboard_tags(tmp_path, monkeypatch, mode):
+def test_tensorboard_keeps_existing_metrics_and_adds_steer_metrics(tmp_path, monkeypatch):
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
     from verl.utils.tracking import Tracking
@@ -466,7 +465,7 @@ def test_tensorboard_tags(tmp_path, monkeypatch, mode):
                 "actor": {
                     "policy_loss": {
                         "loss_mode": "entropy_control",
-                        "entropy_control_mode": mode,
+                        "entropy_control_mode": "quadrant_v3",
                     }
                 }
             }
@@ -475,13 +474,5 @@ def test_tensorboard_tags(tmp_path, monkeypatch, mode):
     tracker.log({"steer/q2_active_count": 3, "actor/pg_loss": -0.1, "val/accuracy": 0.5}, step=1)
     tracker.finish()
     tags = EventAccumulator(str(tmp_path)).Reload().Tags()["scalars"]
-    expected = (
-        ["steer/q2_active_count"]
-        if mode == "quadrant_v3"
-        else [
-            "steer/q2_active_count",
-            "actor/pg_loss",
-            "val/accuracy",
-        ]
-    )
+    expected = ["steer/q2_active_count", "actor/pg_loss", "val/accuracy"]
     assert sorted(tags) == sorted(expected)

@@ -138,7 +138,7 @@ policy_loss:
 
 `token_weight_min` 读取当前训练配方已有的值。两个 `q2_` 参数由 actor 传到策略损失，再传入权重函数。
 
-## 4. TensorBoard 只记录 STEER 指标
+## 4. 在原有 TensorBoard 指标中增加 STEER 指标
 
 在 `pg_losses` 生成后，结合原 PPO 裁剪条件构造指标。**活跃 token** 指原 PPO 策略项对当前采样 token 的对数概率仍有梯度的有效位置。沿用原损失的裁剪判定，包含负优势的 dual-clip 分支。若原实现对新旧对数概率差做数值截断，活跃掩码也按该截断的梯度范围处理。Ⅱ为正优势，PPO 策略项进入裁剪平坦区对应原 `clipped_by_high`。策略损失相等的裁剪边界沿用现有算子的梯度约定。
 
@@ -158,7 +158,7 @@ policy_loss:
 
 1. 每个 microbatch 在 GPU 上累加各指标的分子和分母。使用已有的 `advantages`、PPO `ratio`、裁剪掩码、分数和权重。
 2. 到配置的日志步后，将这些标量打包，所有数据并行卡做一次 `all_reduce(SUM)`。跨卡归约用来汇总日志，Ⅰ、Ⅲ的权重在每次本地调用时已经算好。
-3. 主卡用全局分子除以全局分母后写入 TensorBoard。某项分母为零时，该日志步跳过该比例。可以同时写 `steer/q2_active_count`，该值复用已汇总的Ⅱ活跃计数。
+3. 主卡用全局分子除以全局分母后，将新的 `steer/*` 指标与原有训练指标一起写入 TensorBoard。某项分母为零时，该日志步跳过该比例。可以同时写 `steer/q2_active_count`，该值复用已汇总的Ⅱ活跃计数。
 4. 写入后清零累加器。PyTorch 中把已汇总的标量批量转到 CPU 后写日志，GPU 累加过程覆盖多个 microbatch。
 
 ### 日志算例
