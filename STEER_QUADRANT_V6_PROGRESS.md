@@ -22,6 +22,10 @@
 - 分别核对 V6 与 V5 对照各 98 个 Hydra 启动参数，并与原 datav8 脚本的训练参数逐键比对。源码预检、Bash 语法、Ruff 检查和 `git diff --check` 均通过。
 - NPU/HCCL 实际训练尚未执行。
 
+## HCCL dtype 修复
+
+原统计向量及权重和使用 FP64，HCCL 不支持 Double all-reduce。现将四象限权重和、V5 释放基准权重和、V6 助推和及最终 DP 归约向量统一改为 FP32，并在 V4/V5 测试中断言归约 dtype。修复后 V4、V5、V6 单进程 CPU 测试 73 项通过，3 项双进程 Gloo 归约测试通过。HCCL 集群验证仍待执行。
+
 ## 启动
 
 默认 V6 实验使用 `bash run_steer_quadrant_v6_datav8.sh`。V5 对照沿用同一熵比例，使用独立实验名与零助推强度。

@@ -192,6 +192,7 @@ def test_release_metrics_skip_zero_denominators(index, strength):
     policy_loss(
         tuple(value[:, index : index + 1] for value in batch()), actor_config(0.2, boost_strength=strength), collector
     )
+    assert collector.totals.dtype == torch.float32
     metrics = collector.flush()
     if index == 1:
         assert metrics["steer/q2_release_frac"] == 1
