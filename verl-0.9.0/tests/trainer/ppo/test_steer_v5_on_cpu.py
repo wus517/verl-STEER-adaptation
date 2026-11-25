@@ -147,6 +147,7 @@ def test_release_metrics_skip_zero_denominators(index):
     # Index 1 is clipped Q2. Index 6 belongs to Q1.
     collector = SteerV4Metrics()
     policy_loss(tuple(value[:, index : index + 1] for value in batch()), actor_config(0.2), collector)
+    assert collector.totals.dtype == torch.float32
     metrics = collector.flush()
     if index == 1:
         assert metrics["steer/q2_release_frac"] == 1

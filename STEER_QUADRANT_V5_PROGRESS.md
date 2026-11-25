@@ -16,6 +16,7 @@
 - [x] 固定输入测试、实际梯度、TensorBoard 事件回读。
 - [x] 双进程汇总。
 - [x] 新脚本，校验 V4 对照与 V5 的 Hydra 参数。
+- [x] HCCL 兼容性修复，指标 DP 归约向量使用 FP32。
 
 ## 进度
 
@@ -43,3 +44,7 @@ EXPERIMENT_NAME=steer_v4_control STEER_Q2_HIGH_ENTROPY_RATIO=0.0 \
 CPU 回归在 `verl-0.9.0` 下执行，Python 为 `/tmp/steer-v3-venv/bin/python`，使用 `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`。测试文件为 `tests/trainer/ppo/test_steer{,_v4,_v5}_on_cpu.py`、`tests/trainer/ppo/test_{core_algos,dynamic_policy_losses,loss_aggregation}_on_cpu.py`、`tests/workers/config/test_actor_config_on_cpu.py`、`tests/utils/test_tracking_on_cpu.py` 及 `tests/workers/test_fsdp_gradient_accumulation_sync_on_cpu.py`。单进程批次用 `-k 'not two_process and not distributed'`，另在允许本地进程通信的环境中执行排除的 3 项。
 
 NPU/HCCL、目标模型加载、真实训练首步及长程曲线尚待集群环境验证。
+
+## HCCL dtype 修复
+
+`steer_metrics.py` 原先把整组计数和权重和提升为 FP64，HCCL 不支持 Double all-reduce。现在权重和及归约向量使用 FP32，与 V3 的 DP 归约 dtype 一致。V4/V5 单进程 STEER 测试 50 项通过，V5 专项测试 19 项通过，并断言统计向量为 FP32。本机双进程 Gloo 用例在进程组初始化阶段因沙箱无法解析或绑定本地接口而失败，未执行到归约。HCCL 集群验证仍待执行。
