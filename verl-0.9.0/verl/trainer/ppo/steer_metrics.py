@@ -80,12 +80,12 @@ def compute_steer_v4_statistics(
         active.sum(),
         *(quadrant.sum() for quadrant in quadrants),
         *((quadrant & active).sum() for quadrant in quadrants),
-        *(weights[quadrant].sum(dtype=torch.float64) for quadrant in quadrants),
+        *(weights[quadrant].sum(dtype=torch.float32) for quadrant in quadrants),
         other_mask.sum(),
         other_active.sum(),
-        weights[valid].sum(dtype=torch.float64),
+        weights[valid].sum(dtype=torch.float32),
     ]
-    return torch.stack([value.to(dtype=torch.float64) for value in values])
+    return torch.stack([value.to(dtype=torch.float32) for value in values])
 
 
 class SteerV4Metrics:

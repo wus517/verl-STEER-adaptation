@@ -181,7 +181,7 @@ def test_v4_loss_and_gradient_match_original_steer(aggregation):
     v4_gradient = torch.autograd.grad(v4_loss, v4_log_prob)[0]
     torch.testing.assert_close(v4_loss, original_loss, rtol=0, atol=0)
     torch.testing.assert_close(v4_gradient, original_gradient, rtol=0, atol=0)
-    assert collector.totals.dtype == torch.float64
+    assert collector.totals.dtype == torch.float32
 
 
 def test_one_optimizer_step_matches_original_steer():
@@ -435,7 +435,7 @@ def test_v0_trainer_keeps_steer_tags_unprefixed(monkeypatch):
 
 def test_zero_denominators_keep_counts_and_skip_ratios():
     collector = SteerV4Metrics()
-    collector.add(torch.zeros(17, dtype=torch.float64))
+    collector.add(torch.zeros(17, dtype=torch.float32))
     assert collector.flush() == {"steer/valid_count": 0, "steer/active_count": 0}
 
 
