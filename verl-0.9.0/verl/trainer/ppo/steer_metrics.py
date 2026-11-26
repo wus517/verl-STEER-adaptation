@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
-"""Quadrant statistics for STEER and high-entropy Q2 release."""
+"""Quadrant statistics for STEER and high-entropy weight adjustments."""
 
 from functools import cache
 
@@ -49,6 +49,7 @@ def compute_steer_v4_statistics(
     clip_high,
     clip_ratio_c,
     q2_release: tuple[torch.Tensor, torch.Tensor] | None = None,
+    recovery: tuple[torch.Tensor, torch.Tensor] | None = None,
 ):
     """Compute mask and weight sufficient statistics for one policy-loss call."""
     difference_grad = _clamp_gradient(log_prob_difference, -20.0, 20.0)
@@ -86,17 +87,29 @@ def compute_steer_v4_statistics(
         other_active.sum(),
         weights[valid].sum(dtype=torch.float32),
     ]
+    if recovery is not None:
+        recovery_mask, base_weights = recovery
+        # Keep the legacy Q2 release fields at the same offsets in V7.
+        q2_release = (recovery_mask & quadrants[1], base_weights)
     if q2_release is not None:
-        release_mask, base_weights = q2_release
+        release_mask, q2_base_weights = q2_release
         active_release = release_mask & active
         values.extend(
             [
                 release_mask.sum(),
                 active_release.sum(),
-                base_weights[active_release].sum(dtype=torch.float32),
+                q2_base_weights[active_release].sum(dtype=torch.float32),
                 (weights[active_release] - 1.0).sum(dtype=torch.float32),
             ]
         )
+    if recovery is not None:
+        weight_delta = weights - base_weights
+        for quadrant in quadrants:
+            recovered = recovery_mask & quadrant
+            active_recovered = recovered & active
+            values.extend(
+                [recovered.sum(), active_recovered.sum(), weight_delta[active_recovered].sum(dtype=torch.float32)]
+            )
     return torch.stack([value.to(dtype=torch.float32) for value in values])
 
 
@@ -147,7 +160,7 @@ class SteerV4Metrics:
             metrics["steer/other_active_frac"] = other_active_count / active_count
 
         if len(values) > 17:
-            release_count, active_release_count, active_base_weight_sum, active_boost_sum = values[17:]
+            release_count, active_release_count, active_base_weight_sum, active_boost_sum = values[17:21]
             q2_count = quadrant_counts[1]
             q2_active_count = quadrant_active_counts[1]
             if q2_count > 0:
@@ -157,6 +170,18 @@ class SteerV4Metrics:
             if active_release_count > 0:
                 metrics["steer/q2_release_base_weight_mean"] = active_base_weight_sum / active_release_count
                 metrics["steer/q2_release_boost_mean"] = active_boost_sum / active_release_count
+
+        if len(values) > 21:
+            for index, (count, active) in enumerate(zip(quadrant_counts, quadrant_active_counts, strict=True)):
+                offset = 21 + 3 * index
+                recovered, active_recovered, delta_sum = values[offset : offset + 3]
+                prefix = f"steer/q{index + 1}_recovery"
+                if count > 0:
+                    metrics[f"{prefix}_frac"] = recovered / count
+                if active > 0:
+                    metrics[f"{prefix}_active_frac"] = active_recovered / active
+                if active_recovered > 0:
+                    metrics[f"{prefix}_delta_mean"] = delta_sum / active_recovered
 
         self.totals.zero_()
         return metrics

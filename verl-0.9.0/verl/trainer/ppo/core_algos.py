@@ -1513,21 +1513,40 @@ def compute_steer_v4_weights(
 
 
 @torch.no_grad()
-def select_q2_high_entropy_tokens(
-    entropys: torch.Tensor, q2: torch.Tensor, response_mask: torch.Tensor, top_ratio: float
-) -> torch.Tensor:
-    """Select Q2 positions at or above the microbatch-wide response entropy cutoff."""
+def select_high_entropy_tokens(entropys: torch.Tensor, response_mask: torch.Tensor, top_ratio: float) -> torch.Tensor:
+    """Select valid positions at or above the microbatch-wide response entropy cutoff."""
     if top_ratio == 0.0:
-        return torch.zeros_like(q2)
+        return torch.zeros_like(response_mask, dtype=torch.bool)
 
     valid = response_mask.bool() & torch.isfinite(entropys)
     valid_entropies = entropys[valid]
     if valid_entropies.numel() == 0:
-        return torch.zeros_like(q2)
+        return torch.zeros_like(valid)
 
     top_count = math.ceil(valid_entropies.numel() * top_ratio)
     threshold = valid_entropies.topk(top_count, sorted=False).values.amin()
-    return q2 & valid & (entropys >= threshold)
+    return valid & (entropys >= threshold)
+
+
+@torch.no_grad()
+def select_q2_high_entropy_tokens(
+    entropys: torch.Tensor, q2: torch.Tensor, response_mask: torch.Tensor, top_ratio: float
+) -> torch.Tensor:
+    """Select Q2 positions at or above the microbatch-wide response entropy cutoff."""
+    return q2 & select_high_entropy_tokens(entropys, response_mask, top_ratio)
+
+
+@torch.no_grad()
+def apply_steer_recovery(steer_weights, entropys, response_mask, quadrants, policy):
+    """Restore part of the STEER weight reduction for eligible high-entropy tokens."""
+    selected_quadrants = torch.zeros_like(response_mask, dtype=torch.bool)
+    for quadrant in policy.steer_recovery_quadrants:
+        selected_quadrants |= quadrants[quadrant - 1]
+
+    high_entropy = select_high_entropy_tokens(entropys, response_mask, policy.steer_recovery_top_ratio)
+    recovery_mask = selected_quadrants & high_entropy & (entropys > policy.steer_recovery_min_entropy)
+    adjusted_weights = steer_weights + policy.steer_recovery_rate * (1.0 - steer_weights)
+    return torch.where(recovery_mask, adjusted_weights, steer_weights), recovery_mask
 
 
 @torch.no_grad()
@@ -1574,7 +1593,7 @@ def compute_policy_loss_with_entropy(
     entropys: torch.Tensor | None = None,
     steer_metrics=None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """STEER loss with optional quadrant statistics and high-entropy Q2 release.
+    """STEER loss with optional quadrant statistics and high-entropy weight adjustments.
 
     Aggregation is local, as in the old actor. The loss bridge applies the old
     gradient-accumulation scaling. Cached entropy is not current model entropy.
@@ -1587,9 +1606,11 @@ def compute_policy_loss_with_entropy(
     release_ratio = policy.get("q2_high_entropy_ratio", 0.0)
     boost_strength = policy.get("q2_high_entropy_boost_strength", 0.0)
     use_boost = release_ratio > 0.0 and boost_strength > 0.0
+    recovery_quadrants = policy.get("steer_recovery_quadrants", [])
     quadrants = other_mask = None
     release = None
-    if policy.steer_quadrant_logging or release_ratio > 0.0:
+    recovery = None
+    if policy.steer_quadrant_logging or recovery_quadrants or release_ratio > 0.0:
         weight_result = compute_steer_v4_weights(
             advantages,
             entropys,
@@ -1601,7 +1622,11 @@ def compute_policy_loss_with_entropy(
             return_score_magnitude=use_boost,
         )
         weights, quadrants, other_mask = weight_result[:3]
-        if release_ratio > 0.0:
+        if recovery_quadrants:
+            base_weights = weights
+            weights, recovery_mask = apply_steer_recovery(base_weights, entropys, response_mask, quadrants, policy)
+            recovery = (recovery_mask, base_weights)
+        elif release_ratio > 0.0:
             release_mask = select_q2_high_entropy_tokens(entropys, quadrants[1], response_mask, release_ratio)
             release = (release_mask, weights)
             if use_boost:
@@ -1650,6 +1675,7 @@ def compute_policy_loss_with_entropy(
                 clip_high=clip_high,
                 clip_ratio_c=config.clip_ratio_c,
                 q2_release=release,
+                recovery=recovery,
             )
         )
     valid_weights = weights[response_mask > 0]
