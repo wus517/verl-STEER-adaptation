@@ -50,6 +50,7 @@ def compute_steer_v4_statistics(
     clip_ratio_c,
     q2_release: tuple[torch.Tensor, torch.Tensor] | None = None,
     recovery: tuple[torch.Tensor, torch.Tensor] | None = None,
+    low_entropy_mask: torch.Tensor | None = None,
 ):
     """Compute mask and weight sufficient statistics for one policy-loss call."""
     difference_grad = _clamp_gradient(log_prob_difference, -20.0, 20.0)
@@ -89,7 +90,7 @@ def compute_steer_v4_statistics(
     ]
     if recovery is not None:
         recovery_mask, base_weights = recovery
-        # Keep the legacy Q2 release fields at the same offsets in V7.
+        # Keep the legacy Q2 release fields at the same offsets.
         q2_release = (recovery_mask & quadrants[1], base_weights)
     if q2_release is not None:
         release_mask, q2_base_weights = q2_release
@@ -110,6 +111,12 @@ def compute_steer_v4_statistics(
             values.extend(
                 [recovered.sum(), active_recovered.sum(), weight_delta[active_recovered].sum(dtype=torch.float32)]
             )
+        if low_entropy_mask is not None:
+            for quadrant in quadrants:
+                low = low_entropy_mask & quadrant
+                high = recovery_mask & quadrant
+                values.extend([low.sum(), weights[low].sum(dtype=torch.float32)])
+                values.extend([high.sum(), weights[high].sum(dtype=torch.float32)])
     return torch.stack([value.to(dtype=torch.float32) for value in values])
 
 
@@ -182,6 +189,15 @@ class SteerV4Metrics:
                     metrics[f"{prefix}_active_frac"] = active_recovered / active
                 if active_recovered > 0:
                     metrics[f"{prefix}_delta_mean"] = delta_sum / active_recovered
+
+        if len(values) > 33:
+            for index in range(4):
+                offset = 33 + 4 * index
+                low_count, low_weight_sum, high_count, high_weight_sum = values[offset : offset + 4]
+                if low_count > 0:
+                    metrics[f"steer/q{index + 1}_low_entropy_weight_mean"] = low_weight_sum / low_count
+                if high_count > 0:
+                    metrics[f"steer/q{index + 1}_high_entropy_weight_mean"] = high_weight_sum / high_count
 
         self.totals.zero_()
         return metrics

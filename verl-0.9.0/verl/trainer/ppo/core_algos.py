@@ -1408,8 +1408,9 @@ def compute_token_weights(
     mode: str = "symmetric",
     *,
     return_score_magnitude: bool = False,
+    per_token_weight_min: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Compute STEER weights and optionally return score magnitudes before sanitization."""
+    """Compute STEER weights with optional per-token floors for the symmetric exponential map."""
     with torch.no_grad():
         x = torch.exp(log_prob)
         x = torch.clamp(x, min=1e-08, max=1.0 - 1e-08)
@@ -1457,14 +1458,37 @@ def compute_token_weights(
                 valid_weights = torch.exp(k * valid_metric)
                 valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=token_weight_max)
             else:
-                k = -torch.log(
-                    torch.tensor(token_weight_min, dtype=metric.dtype, device=metric.device)
-                ) / torch.maximum(metric_max, torch.tensor(0.02, dtype=metric.dtype, device=metric.device))
+                denominator = torch.maximum(metric_max, torch.tensor(0.02, dtype=metric.dtype, device=metric.device))
+                k = -torch.log(torch.tensor(token_weight_min, dtype=metric.dtype, device=metric.device)) / denominator
                 valid_weights = torch.exp(-k * valid_metric)
                 valid_weights = torch.clamp(valid_weights, min=token_weight_min, max=1.0)
+                if per_token_weight_min is not None:
+                    floors = per_token_weight_min[valid_mask].to(dtype=metric.dtype)
+                    per_token_k = -torch.log(floors) / denominator
+                    mapped = torch.exp(-per_token_k * valid_metric).maximum(floors).clamp_max(1.0)
+                    valid_weights = torch.where(floors == token_weight_min, valid_weights, mapped)
             token_weights[valid_mask] = valid_weights
         token_weights = token_weights * response_mask.float()
         return (token_weights, score_magnitude) if score_magnitude is not None else token_weights
+
+
+@torch.no_grad()
+def _classify_steer_quadrants(advantages, entropys, log_prob, response_mask):
+    """Return the four STEER quadrant masks and the remaining valid positions."""
+    valid = response_mask.bool()
+    probability = log_prob.exp().clamp(min=1e-8, max=1.0 - 1e-8)
+    boundary = probability.log() + entropys
+    classifiable = valid & torch.isfinite(advantages) & torch.isfinite(boundary)
+
+    high_probability = boundary > 0
+    low_probability = boundary < 0
+    q1 = classifiable & (advantages > 0) & high_probability
+    q2 = classifiable & (advantages > 0) & low_probability
+    q3 = classifiable & (advantages < 0) & low_probability
+    q4 = classifiable & (advantages < 0) & high_probability
+    quadrants = (q1, q2, q3, q4)
+    other_mask = valid & ~(q1 | q2 | q3 | q4)
+    return quadrants, other_mask
 
 
 @torch.no_grad()
@@ -1479,20 +1503,8 @@ def compute_steer_v4_weights(
     token_weight_max,
     return_score_magnitude=False,
 ):
-    """Classify STEER tokens while returning the original helper's weights unchanged."""
-    valid = response_mask.bool()
-    probability = log_prob.exp().clamp(min=1e-8, max=1.0 - 1e-8)
-    boundary = probability.log() + entropys
-    classifiable = valid & torch.isfinite(advantages) & torch.isfinite(boundary)
-
-    high_probability = boundary > 0
-    low_probability = boundary < 0
-    q1 = classifiable & (advantages > 0) & high_probability
-    q2 = classifiable & (advantages > 0) & low_probability
-    q3 = classifiable & (advantages < 0) & low_probability
-    q4 = classifiable & (advantages < 0) & high_probability
-    quadrants = (q1, q2, q3, q4)
-    other_mask = valid & ~(q1 | q2 | q3 | q4)
+    """Return the original STEER weights with their quadrant classification."""
+    quadrants, other_mask = _classify_steer_quadrants(advantages, entropys, log_prob, response_mask)
 
     weights = compute_token_weights(
         advantages=advantages,
@@ -1534,6 +1546,45 @@ def select_q2_high_entropy_tokens(
 ) -> torch.Tensor:
     """Select Q2 positions at or above the microbatch-wide response entropy cutoff."""
     return q2 & select_high_entropy_tokens(entropys, response_mask, top_ratio)
+
+
+@torch.no_grad()
+def compute_steer_v8_weights(advantages, entropys, old_log_prob, log_prob, response_mask, policy):
+    """Map low and high entropy positions with a common STEER denominator, then restore high weights."""
+    quadrants, other_mask = _classify_steer_quadrants(advantages, entropys, log_prob, response_mask)
+    ranked_high = select_high_entropy_tokens(entropys, response_mask, policy.steer_recovery_top_ratio)
+    high_entropy = ranked_high & (entropys > policy.steer_recovery_min_entropy)
+    low_entropy = response_mask.bool() & torch.isfinite(entropys) & ~high_entropy
+
+    floors = torch.full_like(entropys, policy.token_weight_min, dtype=torch.float32)
+    recovery_rate = torch.zeros_like(floors)
+    recovery_mask = torch.zeros_like(high_entropy)
+    low_entropy_mask = torch.zeros_like(low_entropy)
+    for quadrant in policy.steer_recovery_quadrants:
+        index = quadrant - 1
+        high = quadrants[index] & high_entropy
+        low = quadrants[index] & low_entropy
+        floors.masked_fill_(low, policy.steer_low_entropy_weight_min)
+        floors.masked_fill_(high, policy.steer_high_entropy_weight_min_by_quadrant[index])
+        recovery_rate.masked_fill_(high, policy.steer_recovery_rate_by_quadrant[index])
+        recovery_mask |= high
+        low_entropy_mask |= low
+
+    pre_recovery_weights = compute_token_weights(
+        advantages,
+        entropys,
+        old_log_prob,
+        log_prob,
+        response_mask,
+        token_weight_min=policy.token_weight_min,
+        token_weight_max=policy.token_weight_max,
+        linear=False,
+        mode="symmetric",
+        per_token_weight_min=floors,
+    )
+    adjusted = pre_recovery_weights + recovery_rate * (1.0 - pre_recovery_weights)
+    weights = torch.where(recovery_mask, adjusted, pre_recovery_weights)
+    return weights, quadrants, other_mask, (recovery_mask, pre_recovery_weights), low_entropy_mask
 
 
 @torch.no_grad()
@@ -1610,7 +1661,12 @@ def compute_policy_loss_with_entropy(
     quadrants = other_mask = None
     release = None
     recovery = None
-    if policy.steer_quadrant_logging or recovery_quadrants or release_ratio > 0.0:
+    low_entropy_mask = None
+    if recovery_quadrants and policy.get("steer_entropy_weighting", False):
+        weights, quadrants, other_mask, recovery, low_entropy_mask = compute_steer_v8_weights(
+            advantages, entropys, old_log_prob, log_prob, response_mask, policy
+        )
+    elif policy.steer_quadrant_logging or recovery_quadrants or release_ratio > 0.0:
         weight_result = compute_steer_v4_weights(
             advantages,
             entropys,
@@ -1676,6 +1732,7 @@ def compute_policy_loss_with_entropy(
                 clip_ratio_c=config.clip_ratio_c,
                 q2_release=release,
                 recovery=recovery,
+                low_entropy_mask=low_entropy_mask,
             )
         )
     valid_weights = weights[response_mask > 0]
